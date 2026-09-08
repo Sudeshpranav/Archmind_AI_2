@@ -1,0 +1,10 @@
+streamlit
+pandas
+numpy
+joblib
+trimesh
+huggingface_hub
+scikit-learn
+xgboost
+shap
+matplotlib
