@@ -10,12 +10,12 @@ from huggingface_hub import hf_hub_download
 
 
 # ============================================================
-# ARCHMIND PRO V2.2
+# ARCHMIND PRO V2.3
 # AI-POWERED CONSTRUCTION MATERIAL INTELLIGENCE
 # ============================================================
 
 st.set_page_config(
-    page_title="ArchMind Pro V2.2",
+    page_title="ArchMind Pro V2.3",
     page_icon="🏗️",
     layout="wide"
 )
@@ -161,7 +161,10 @@ def load_models_from_huggingface():
     return models, errors
 
 
-# Load models
+# ============================================================
+# LOAD MODELS
+# ============================================================
+
 models, model_errors = load_models_from_huggingface()
 
 
@@ -173,7 +176,7 @@ with st.sidebar:
 
     st.title("🏗️ ArchMind Pro")
 
-    st.caption("V2.2 Material Intelligence")
+    st.caption("V2.3 Material Intelligence")
 
     st.markdown("---")
 
@@ -265,7 +268,8 @@ with st.sidebar:
 
     st.caption(
         "Synthetic engineering-informed ML prototype. "
-        "Outputs are planning estimates and not structural design certification."
+        "Outputs are planning estimates and not structural "
+        "design certification."
     )
 
 
@@ -331,6 +335,7 @@ def convert_extents(extents, unit):
     }
 
     if unit not in factors:
+
         raise ValueError(
             f"Unsupported unit: {unit}"
         )
@@ -345,10 +350,14 @@ def convert_extents(extents, unit):
 
 
 # ============================================================
-# FEATURE ENGINEERING
+# V2.3 FEATURE ENGINEERING
 # ============================================================
 
 def estimate_features(mesh, unit):
+
+    # ========================================================
+    # CONVERT STL DIMENSIONS TO FEET
+    # ========================================================
 
     dims_ft = convert_extents(
         mesh.extents,
@@ -360,26 +369,115 @@ def estimate_features(mesh, unit):
         0.001
     )
 
-    # --------------------------------------------------------
-    # STL orientation is not guaranteed.
-    # Use the two largest dimensions as footprint dimensions.
-    # Number of floors is explicitly selected by the user.
-    # --------------------------------------------------------
+    # ========================================================
+    # V2.3 ORIENTATION-AWARE GEOMETRY
+    # ========================================================
 
-    sorted_dims = np.sort(dims_ft)
+    # STL files do not guarantee a consistent X/Y/Z
+    # orientation.
+    #
+    # We assume the largest dimension is the candidate
+    # vertical dimension.
+    #
+    # The two remaining dimensions become the footprint.
 
-    footprint_x = sorted_dims[-1]
+    height_ft = float(
+        np.max(dims_ft)
+    )
 
-    footprint_y = sorted_dims[-2]
+    footprint_dims = np.sort(dims_ft)[:2]
+
+    footprint_x = float(
+        footprint_dims[0]
+    )
+
+    footprint_y = float(
+        footprint_dims[1]
+    )
+
+    # ========================================================
+    # FOOTPRINT
+    # ========================================================
 
     floor_area = (
         footprint_x *
         footprint_y
     )
 
-    # --------------------------------------------------------
-    # Built-up area
-    # --------------------------------------------------------
+    # ========================================================
+    # EXPECTED BUILDING HEIGHT
+    # ========================================================
+
+    expected_height = (
+        num_floors *
+        floor_height
+    )
+
+    height_ratio = (
+        height_ft /
+        max(
+            expected_height,
+            0.1
+        )
+    )
+
+    # ========================================================
+    # HEIGHT VALIDATION
+    # ========================================================
+
+    # Generous tolerance for:
+    # - partial STL models
+    # - roof/parapet geometry
+    # - imperfect exports
+    #
+    # It is NOT intended as structural certification.
+
+    height_valid = (
+        0.60 <= height_ratio <= 1.80
+    )
+
+    # ========================================================
+    # ASPECT RATIO VALIDATION
+    # ========================================================
+
+    aspect_ratio = (
+        height_ft /
+        max(
+            min(
+                footprint_x,
+                footprint_y
+            ),
+            0.1
+        )
+    )
+
+    # Very tall objects compared with their footprint
+    # are suspicious as conventional buildings.
+
+    extreme_geometry = (
+        aspect_ratio > 8.0
+    )
+
+    geometry_warning = None
+
+    if not height_valid:
+
+        geometry_warning = (
+            "The STL height is inconsistent with the "
+            "selected floor count and floor height."
+        )
+
+    elif extreme_geometry:
+
+        geometry_warning = (
+            "The uploaded geometry is unusually tall "
+            "relative to its footprint. Verify that the "
+            "STL represents a conventional building structure."
+        )
+
+    # ========================================================
+    # BUILT-UP AREA
+    # ========================================================
 
     built_up = (
         floor_area *
@@ -387,9 +485,9 @@ def estimate_features(mesh, unit):
         1.05
     )
 
-    # --------------------------------------------------------
-    # Building perimeter
-    # --------------------------------------------------------
+    # ========================================================
+    # BUILDING PERIMETER
+    # ========================================================
 
     perimeter = (
         2.0 *
@@ -399,9 +497,9 @@ def estimate_features(mesh, unit):
         )
     )
 
-    # --------------------------------------------------------
-    # Estimate rooms
-    # --------------------------------------------------------
+    # ========================================================
+    # ROOM ESTIMATION
+    # ========================================================
 
     rooms_per_floor = max(
         1,
@@ -412,15 +510,17 @@ def estimate_features(mesh, unit):
 
     num_rooms = max(
         1,
-        rooms_per_floor * num_floors
+        rooms_per_floor *
+        num_floors
     )
 
-    # --------------------------------------------------------
-    # Estimate wall length
-    # --------------------------------------------------------
+    # ========================================================
+    # WALL LENGTH
+    # ========================================================
 
     wall_length = (
-        perimeter * num_floors
+        perimeter *
+        num_floors
         +
         (
             math.sqrt(
@@ -429,16 +529,18 @@ def estimate_features(mesh, unit):
                     1.0
                 )
             )
-            * 0.35
-            * num_floors
+            *
+            0.35
+            *
+            num_floors
         )
     )
 
     wall_height = floor_height
 
-    # --------------------------------------------------------
-    # Openings
-    # --------------------------------------------------------
+    # ========================================================
+    # OPENINGS
+    # ========================================================
 
     gross_wall_area = (
         wall_length *
@@ -455,9 +557,9 @@ def estimate_features(mesh, unit):
         0.12
     )
 
-    # --------------------------------------------------------
-    # Slab / roof
-    # --------------------------------------------------------
+    # ========================================================
+    # SLAB / ROOF
+    # ========================================================
 
     slab_area = (
         floor_area *
@@ -466,9 +568,9 @@ def estimate_features(mesh, unit):
 
     roof_area = floor_area
 
-    # --------------------------------------------------------
-    # Foundation
-    # --------------------------------------------------------
+    # ========================================================
+    # FOUNDATION
+    # ========================================================
 
     foundation_area = (
         floor_area *
@@ -477,12 +579,9 @@ def estimate_features(mesh, unit):
 
     slab_thickness = 5.5
 
-    # --------------------------------------------------------
-    # Concrete estimation
-    #
-    # This is an engineering-informed approximation used
-    # to generate model inputs.
-    # --------------------------------------------------------
+    # ========================================================
+    # CONCRETE ESTIMATION
+    # ========================================================
 
     slab_volume = (
         slab_area
@@ -529,54 +628,98 @@ def estimate_features(mesh, unit):
         frame_volume
     )
 
-    # --------------------------------------------------------
-    # Final V2.2 feature dictionary
-    # --------------------------------------------------------
+    # ========================================================
+    # FINAL V2.2 MODEL FEATURES
+    # ========================================================
 
     return {
 
         "building_type": building_type,
 
-        "floor_area_sqft": floor_area,
+        "floor_area_sqft":
+            floor_area,
 
-        "built_up_area_sqft": built_up,
+        "built_up_area_sqft":
+            built_up,
 
-        "num_floors": num_floors,
+        "num_floors":
+            num_floors,
 
-        "num_rooms": num_rooms,
+        "num_rooms":
+            num_rooms,
 
-        "wall_length_ft": wall_length,
+        "wall_length_ft":
+            wall_length,
 
-        "wall_thickness_in": wall_thickness,
+        "wall_thickness_in":
+            wall_thickness,
 
-        "wall_height_ft": wall_height,
+        "wall_height_ft":
+            wall_height,
 
-        "foundation_depth_ft": foundation_depth,
+        "foundation_depth_ft":
+            foundation_depth,
 
-        "foundation_area_sqft": foundation_area,
+        "foundation_area_sqft":
+            foundation_area,
 
-        "door_area_sqft": door_area,
+        "door_area_sqft":
+            door_area,
 
-        "window_area_sqft": window_area,
+        "window_area_sqft":
+            window_area,
 
-        "slab_area_sqft": slab_area,
+        "slab_area_sqft":
+            slab_area,
 
-        "roof_area_sqft": roof_area,
+        "roof_area_sqft":
+            roof_area,
 
-        "slab_thickness_in": slab_thickness,
+        "slab_thickness_in":
+            slab_thickness,
 
-        "concrete_volume_m3": concrete_volume,
+        "concrete_volume_m3":
+            concrete_volume,
 
-        "soil_condition": soil_condition,
+        "soil_condition":
+            soil_condition,
 
         "soil_bearing_capacity_kpa":
-            SOIL_BEARING[soil_condition],
+            SOIL_BEARING[
+                soil_condition
+            ],
 
         "structural_intensity":
             structural_intensity,
 
         "masonry_type":
             masonry_type,
+
+        # ====================================================
+        # V2.3 VALIDATION METADATA
+        # These are NOT sent to the ML models.
+        # ====================================================
+
+        "_geometry_height_ft":
+            height_ft,
+
+        "_expected_height_ft":
+            expected_height,
+
+        "_height_ratio":
+            height_ratio,
+
+        "_aspect_ratio":
+            aspect_ratio,
+
+        "_height_valid":
+            height_valid,
+
+        "_extreme_geometry":
+            extreme_geometry,
+
+        "_geometry_warning":
+            geometry_warning,
     }
 
 
@@ -587,7 +730,7 @@ def estimate_features(mesh, unit):
 if page == "About":
 
     st.title(
-        "🏗️ ArchMind Pro V2.2"
+        "🏗️ ArchMind Pro V2.3"
     )
 
     st.write(
@@ -611,15 +754,35 @@ if page == "About":
     )
 
     st.write(
-        "3. Project parameters are combined with the geometry."
+        "3. V2.3 validates the geometry against the "
+        "selected building configuration."
     )
 
     st.write(
-        "4. Custom-trained ML models estimate construction materials."
+        "4. Project parameters are combined with "
+        "the geometry."
     )
 
     st.write(
-        "5. Material predictions are presented as planning estimates."
+        "5. Custom-trained ML models estimate "
+        "construction materials."
+    )
+
+    st.write(
+        "6. Material predictions are presented as "
+        "planning estimates."
+    )
+
+    st.markdown("---")
+
+    st.subheader(
+        "V2.3 Geometry Validation"
+    )
+
+    st.write(
+        "ArchMind checks model height, expected building "
+        "height and geometry aspect ratio before allowing "
+        "ML prediction."
     )
 
     st.markdown("---")
@@ -672,9 +835,9 @@ elif page in [
         "Extracting structural features from 3D geometry."
     )
 
-    # --------------------------------------------------------
-    # Model loading status
-    # --------------------------------------------------------
+    # ========================================================
+    # MODEL STATUS
+    # ========================================================
 
     if model_errors:
 
@@ -684,7 +847,10 @@ elif page in [
         )
 
         for error in model_errors:
-            st.code(error)
+
+            st.code(
+                error
+            )
 
         st.info(
             f"Expected Hugging Face repository: "
@@ -693,9 +859,9 @@ elif page in [
 
         st.stop()
 
-    # --------------------------------------------------------
-    # All models successfully loaded
-    # --------------------------------------------------------
+    # ========================================================
+    # SUCCESSFUL MODEL LOAD
+    # ========================================================
 
     st.success(
         "✅ ArchMind V2.2 ML models loaded successfully."
@@ -708,7 +874,10 @@ elif page in [
     uploaded = st.file_uploader(
         "Upload STL Structural File",
         type=["stl"],
-        help="Upload an STL model representing the structure."
+        help=(
+            "Upload an STL model representing "
+            "the building structure."
+        )
     )
 
     # ========================================================
@@ -737,9 +906,9 @@ elif page in [
 
         try:
 
-            # ------------------------------------------------
-            # Load mesh
-            # ------------------------------------------------
+            # =================================================
+            # LOAD MESH
+            # =================================================
 
             mesh = load_mesh(
                 uploaded
@@ -753,9 +922,9 @@ elif page in [
 
                 st.stop()
 
-            # ------------------------------------------------
-            # Extract features
-            # ------------------------------------------------
+            # =================================================
+            # FEATURE EXTRACTION
+            # =================================================
 
             features = estimate_features(
                 mesh,
@@ -767,9 +936,9 @@ elif page in [
                 unit
             )
 
-            # ------------------------------------------------
-            # Geometry information
-            # ------------------------------------------------
+            # =================================================
+            # GEOMETRY ANALYSIS
+            # =================================================
 
             st.markdown(
                 "### 📐 Geometry Analysis"
@@ -793,16 +962,141 @@ elif page in [
             )
 
             c4.metric(
-                "Mesh Volume",
-                f"{abs(mesh.volume):,.2f}"
+                "Model Height",
+                f"{features['_geometry_height_ft']:,.1f} ft"
             )
 
             st.caption(
-                "Converted bounding dimensions: "
+                "Bounding dimensions: "
                 f"{dims[0]:.2f} × "
                 f"{dims[1]:.2f} × "
                 f"{dims[2]:.2f} ft"
             )
+
+            # =================================================
+            # STRUCTURAL GEOMETRY VALIDATION
+            # =================================================
+
+            st.markdown(
+                "### 🏗️ Structural Geometry Validation"
+            )
+
+            height_ft = (
+                features["_geometry_height_ft"]
+            )
+
+            expected_height = (
+                features["_expected_height_ft"]
+            )
+
+            height_ratio = (
+                features["_height_ratio"]
+            )
+
+            height_valid = (
+                features["_height_valid"]
+            )
+
+            extreme_geometry = (
+                features["_extreme_geometry"]
+            )
+
+            # -------------------------------------------------
+            # VALID
+            # -------------------------------------------------
+
+            if (
+                height_valid
+                and
+                not extreme_geometry
+            ):
+
+                st.success(
+                    "✅ Geometry is reasonably consistent "
+                    "with the selected building configuration."
+                )
+
+                geometry_ready = True
+
+            # -------------------------------------------------
+            # EXTREME GEOMETRY
+            # -------------------------------------------------
+
+            elif extreme_geometry:
+
+                st.warning(
+                    "⚠️ This geometry is unusually tall "
+                    "relative to its footprint. Verify that "
+                    "the STL represents a conventional "
+                    "building structure."
+                )
+
+                geometry_ready = False
+
+            # -------------------------------------------------
+            # HEIGHT MISMATCH
+            # -------------------------------------------------
+
+            else:
+
+                st.warning(
+                    "⚠️ Model height does not closely match "
+                    "the selected floor count and floor height."
+                )
+
+                geometry_ready = False
+
+            # =================================================
+            # VALIDATION METRICS
+            # =================================================
+
+            v1, v2, v3 = st.columns(3)
+
+            v1.metric(
+                "Model Height",
+                f"{height_ft:,.1f} ft"
+            )
+
+            v2.metric(
+                "Expected Height",
+                f"{expected_height:,.1f} ft"
+            )
+
+            v3.metric(
+                "Height Ratio",
+                f"{height_ratio:.2f}×"
+            )
+
+            # =================================================
+            # VALIDATION EXPLANATION
+            # =================================================
+
+            with st.expander(
+                "ℹ️ How geometry validation works"
+            ):
+
+                st.write(
+                    "ArchMind identifies the largest dimension "
+                    "of the STL as the candidate vertical "
+                    "dimension and uses the other two dimensions "
+                    "to estimate the footprint."
+                )
+
+                st.write(
+                    "The estimated model height is then compared "
+                    "with the selected number of floors and "
+                    "floor height."
+                )
+
+                st.write(
+                    "This is a sanity check for ML input quality, "
+                    "not a structural engineering certification."
+                )
+
+                st.write(
+                    f"Current height ratio: "
+                    f"{height_ratio:.2f}×"
+                )
 
             # =================================================
             # FEATURE PREVIEW
@@ -814,6 +1108,7 @@ elif page in [
                     "Features Sent to V2.2 ML"
                 )
 
+                # Only actual ML features are shown.
                 feature_df = (
                     pd.DataFrame(
                         [features]
@@ -833,7 +1128,8 @@ elif page in [
 
                 st.info(
                     "These features are generated from the "
-                    "uploaded STL geometry and project configuration."
+                    "uploaded STL geometry and project "
+                    "configuration."
                 )
 
             # =================================================
@@ -846,144 +1142,228 @@ elif page in [
                     "### Ready for ML Prediction"
                 )
 
-                if st.button(
-                    "🚀 RUN ARCHMIND V2.2",
-                    use_container_width=True,
-                    type="primary"
-                ):
+                # ------------------------------------------------
+                # BLOCK INVALID GEOMETRY
+                # ------------------------------------------------
 
-                    # -----------------------------------------
-                    # Prepare input
-                    # -----------------------------------------
+                if not geometry_ready:
 
-                    input_df = (
-                        pd.DataFrame(
-                            [features]
-                        )[FEATURES]
+                    st.error(
+                        "🚫 ML prediction is paused because "
+                        "the uploaded geometry did not pass "
+                        "the structural geometry validation check."
                     )
 
-                    # -----------------------------------------
-                    # Prediction
-                    # -----------------------------------------
+                    st.info(
+                        "Please verify the STL unit, model "
+                        "orientation, floor count and floor "
+                        "height before running material prediction."
+                    )
 
-                    predictions = {}
+                # ------------------------------------------------
+                # VALID GEOMETRY
+                # ------------------------------------------------
 
-                    for target, model in models.items():
+                else:
 
-                        prediction = model.predict(
-                            input_df
+                    st.success(
+                        "✅ Geometry validation passed. "
+                        "ML prediction is available."
+                    )
+
+                    if st.button(
+                        "🚀 RUN ARCHMIND V2.3",
+                        use_container_width=True,
+                        type="primary"
+                    ):
+
+                        # =========================================
+                        # PREPARE MODEL INPUT
+                        # =========================================
+
+                        input_df = (
+                            pd.DataFrame(
+                                [features]
+                            )[FEATURES]
                         )
 
-                        value = float(
-                            np.asarray(
-                                prediction
+                        # =========================================
+                        # PREDICTION
+                        # =========================================
+
+                        predictions = {}
+
+                        for target, model in models.items():
+
+                            prediction = model.predict(
+                                input_df
                             )
-                            .reshape(-1)[0]
-                        )
 
-                        predictions[target] = max(
-                            0.0,
-                            value
-                        )
+                            value = float(
+                                np.asarray(
+                                    prediction
+                                )
+                                .reshape(-1)[0]
+                            )
 
-                    # =================================================
-                    # RESULTS
-                    # =================================================
+                            predictions[target] = max(
+                                0.0,
+                                value
+                            )
 
-                    st.markdown(
-                        "### 📊 Resource Allocation"
-                    )
-
-                    a, b = st.columns(2)
-
-                    with a:
+                        # =========================================
+                        # RESULTS
+                        # =========================================
 
                         st.markdown(
-                            f"""
-                            <div class="res-card">
-                                <h4>🧱 Cement</h4>
-                                <h2>
-                                    {predictions["cement_bags"]:,.0f}
-                                    bags
-                                </h2>
-                            </div>
-                            """,
-                            unsafe_allow_html=True
+                            "### 📊 Resource Allocation"
                         )
 
-                    with b:
+                        a, b = st.columns(2)
 
-                        st.markdown(
-                            f"""
-                            <div class="res-card">
-                                <h4>🔩 Steel Rebar</h4>
-                                <h2>
-                                    {predictions["steel_tonnes"]:,.2f}
-                                    tonnes
-                                </h2>
-                            </div>
-                            """,
-                            unsafe_allow_html=True
+                        # -----------------------------------------
+                        # CEMENT
+                        # -----------------------------------------
+
+                        with a:
+
+                            st.markdown(
+                                f"""
+                                <div class="res-card">
+                                    <h4>🧱 Cement</h4>
+                                    <h2>
+                                        {predictions["cement_bags"]:,.0f}
+                                        bags
+                                    </h2>
+                                </div>
+                                """,
+                                unsafe_allow_html=True
+                            )
+
+                        # -----------------------------------------
+                        # STEEL
+                        # -----------------------------------------
+
+                        with b:
+
+                            st.markdown(
+                                f"""
+                                <div class="res-card">
+                                    <h4>🔩 Steel Rebar</h4>
+                                    <h2>
+                                        {predictions["steel_tonnes"]:,.2f}
+                                        tonnes
+                                    </h2>
+                                </div>
+                                """,
+                                unsafe_allow_html=True
+                            )
+
+                        c, d = st.columns(2)
+
+                        # -----------------------------------------
+                        # BRICKS
+                        # -----------------------------------------
+
+                        with c:
+
+                            st.markdown(
+                                f"""
+                                <div class="res-card">
+                                    <h4>🧱 Bricks</h4>
+                                    <h2>
+                                        {predictions["brick_count"]:,.0f}
+                                    </h2>
+                                </div>
+                                """,
+                                unsafe_allow_html=True
+                            )
+
+                        # -----------------------------------------
+                        # AAC
+                        # -----------------------------------------
+
+                        with d:
+
+                            st.markdown(
+                                f"""
+                                <div class="res-card">
+                                    <h4>⬜ AAC Blocks</h4>
+                                    <h2>
+                                        {predictions["aac_block_count"]:,.0f}
+                                    </h2>
+                                </div>
+                                """,
+                                unsafe_allow_html=True
+                            )
+
+                        # =========================================
+                        # INPUT SUMMARY
+                        # =========================================
+
+                        st.subheader(
+                            "Prediction Input Summary"
                         )
 
-                    c, d = st.columns(2)
-
-                    with c:
-
-                        st.markdown(
-                            f"""
-                            <div class="res-card">
-                                <h4>🧱 Bricks</h4>
-                                <h2>
-                                    {predictions["brick_count"]:,.0f}
-                                </h2>
-                            </div>
-                            """,
-                            unsafe_allow_html=True
+                        st.dataframe(
+                            input_df.T.rename(
+                                columns={
+                                    0: "value"
+                                }
+                            ),
+                            use_container_width=True
                         )
 
-                    with d:
+                        # =========================================
+                        # VALIDATION SUMMARY
+                        # =========================================
 
-                        st.markdown(
-                            f"""
-                            <div class="res-card">
-                                <h4>⬜ AAC Blocks</h4>
-                                <h2>
-                                    {predictions["aac_block_count"]:,.0f}
-                                </h2>
-                            </div>
-                            """,
-                            unsafe_allow_html=True
+                        st.subheader(
+                            "Geometry Validation Summary"
                         )
 
-                    # =================================================
-                    # INPUT SUMMARY
-                    # =================================================
-
-                    st.subheader(
-                        "Prediction Input Summary"
-                    )
-
-                    st.dataframe(
-                        input_df.T.rename(
-                            columns={
-                                0: "value"
+                        validation_df = pd.DataFrame(
+                            {
+                                "Metric": [
+                                    "Model Height",
+                                    "Expected Height",
+                                    "Height Ratio",
+                                    "Height Validation",
+                                    "Extreme Geometry"
+                                ],
+                                "Value": [
+                                    f"{height_ft:,.2f} ft",
+                                    f"{expected_height:,.2f} ft",
+                                    f"{height_ratio:.2f}×",
+                                    "PASS"
+                                    if height_valid
+                                    else "WARNING",
+                                    "YES"
+                                    if extreme_geometry
+                                    else "NO"
+                                ]
                             }
-                        ),
-                        use_container_width=True
-                    )
+                        )
 
-                    # =================================================
-                    # DISCLAIMER
-                    # =================================================
+                        st.dataframe(
+                            validation_df,
+                            use_container_width=True,
+                            hide_index=True
+                        )
 
-                    st.warning(
-                        "⚠️ These are ML planning estimates generated "
-                        "from the V2.2 synthetic engineering-informed "
-                        "training distribution. They are not a substitute "
-                        "for structural drawings, BOQs, quantity surveys "
-                        "or professional engineering."
-                    )
+                        # =========================================
+                        # DISCLAIMER
+                        # =========================================
+
+                        st.warning(
+                            "⚠️ These are ML planning estimates "
+                            "generated from the V2.2 synthetic "
+                            "engineering-informed training "
+                            "distribution. They are not a "
+                            "substitute for structural drawings, "
+                            "BOQs, quantity surveys or "
+                            "professional engineering."
+                        )
 
         except Exception as e:
 
