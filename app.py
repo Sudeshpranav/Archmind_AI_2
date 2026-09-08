@@ -1577,19 +1577,20 @@ if page == "Material Prediction":
                     "match the selected floor configuration."
                 )
 
+            difference = abs(
+                geometry["height_ft"]
+                -
+                geometry["expected_height"]
+            )
+            
             st.write(
                 f"""
-                **Model:** {geometry['height_ft']:.1f} ft
-
-                **Expected:** {geometry['expected_height']:.1f} ft
-
-                **Difference:** "
-                {abs(
-                    geometry['height_ft']
-                    -
-                    geometry['expected_height']
-                ):.1f} ft
-                """
+            **Model:** {geometry['height_ft']:.1f} ft
+            
+            **Expected:** {geometry['expected_height']:.1f} ft
+            
+            **Difference:** {difference:.1f} ft
+            """
             )
 
         # ----------------------------------------------------
