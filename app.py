@@ -1,29 +1,26 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import trimesh
-import joblib
+import io
 import math
+import pickle
+import warnings
 
+import cv2
+import joblib
+import numpy as np
+import pandas as pd
+import streamlit as st
+import trimesh
+from PIL import Image
 from huggingface_hub import hf_hub_download
 
-
-# ============================================================
-# ARCHMIND PRO V2.4.1
-# Intelligent Construction Material Intelligence
-# ============================================================
-
-st.set_page_config(
-    page_title="ArchMind Pro",
-    page_icon="🏗️",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+warnings.filterwarnings("ignore")
 
 
 # ============================================================
-# CONFIGURATION
+# ARCHMIND PRO V2.5
+# AI-POWERED CONSTRUCTION MATERIAL INTELLIGENCE
 # ============================================================
+
+APP_VERSION = "V2.5"
 
 HF_REPO_ID = "AloneMrY/archmind-pro-v2-2-models"
 
@@ -31,12 +28,10 @@ TARGET_FILES = {
     "cement_bags": "cement_bags_model.joblib",
     "steel_tonnes": "steel_tonnes_model.joblib",
     "brick_count": "brick_count_model.joblib",
-    "aac_block_count": "aac_block_count_model.joblib"
+    "aac_block_count": "aac_block_count_model.joblib",
 }
 
-
 FEATURES = [
-    "building_type",
     "floor_area_sqft",
     "built_up_area_sqft",
     "num_floors",
@@ -50,45 +45,29 @@ FEATURES = [
     "window_area_sqft",
     "slab_area_sqft",
     "roof_area_sqft",
-    "slab_thickness_in",
     "concrete_volume_m3",
-    "soil_condition",
+    "slab_thickness_in",
     "soil_bearing_capacity_kpa",
     "structural_intensity",
-    "masonry_type"
 ]
 
+SOIL_SCORE = {
+    "weak": 1,
+    "normal": 2,
+    "good": 3,
+}
+
+MASONRY_TYPES = ["brick", "aac", "mixed"]
+
 
 # ============================================================
-# CSS
+# PAGE CONFIG
 # ============================================================
 
-st.markdown(
-    """
-    <style>
-
-    .main-title {
-        font-size: 42px;
-        font-weight: 800;
-        margin-bottom: 0px;
-    }
-
-    .subtitle {
-        font-size: 18px;
-        opacity: 0.75;
-        margin-bottom: 20px;
-    }
-
-    .status-box {
-        padding: 10px 15px;
-        border-radius: 8px;
-        font-weight: 600;
-        margin-bottom: 15px;
-    }
-
-    </style>
-    """,
-    unsafe_allow_html=True
+st.set_page_config(
+    page_title="ArchMind Pro",
+    page_icon="🏗️",
+    layout="wide",
 )
 
 
@@ -96,26 +75,103 @@ st.markdown(
 # HEADER
 # ============================================================
 
-st.markdown(
-    '<div class="main-title">🏗️ ArchMind Pro</div>',
-    unsafe_allow_html=True
-)
-
-st.markdown(
-    '<div class="subtitle">'
-    'Intelligent Construction Material Intelligence'
-    '</div>',
-    unsafe_allow_html=True
-)
-
+st.title("🏗️ ArchMind Pro")
 st.caption(
-    "V2.4.1 — Intelligent building geometry extraction "
-    "and ML-assisted material prediction"
+    "AI-powered construction material intelligence from 3D structural geometry"
 )
 
-st.markdown(
-    '<div class="status-box">🟢 System Online</div>',
-    unsafe_allow_html=True
+st.success(f"🟢 System Online — {APP_VERSION}")
+
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+
+st.sidebar.header("⚙️ Project Configuration")
+
+building_type = st.sidebar.selectbox(
+    "Building Type",
+    [
+        "Small Residential",
+        "Medium Residential",
+        "Large Residential",
+        "Small Commercial",
+        "Medium Commercial",
+        "Large Commercial",
+        "Industrial",
+        "Institutional",
+    ],
+)
+
+num_floors_input = st.sidebar.number_input(
+    "Selected Number of Floors",
+    min_value=1,
+    max_value=100,
+    value=1,
+    step=1,
+)
+
+floor_height = st.sidebar.number_input(
+    "Floor Height (ft)",
+    min_value=7.0,
+    max_value=30.0,
+    value=10.0,
+    step=0.5,
+)
+
+foundation_depth = st.sidebar.number_input(
+    "Foundation Depth (ft)",
+    min_value=1.0,
+    max_value=30.0,
+    value=5.0,
+    step=0.5,
+)
+
+wall_thickness = st.sidebar.number_input(
+    "Wall Thickness (in)",
+    min_value=3.0,
+    max_value=24.0,
+    value=9.0,
+    step=0.5,
+)
+
+soil_condition = st.sidebar.selectbox(
+    "Soil Condition",
+    ["weak", "normal", "good"],
+    index=1,
+)
+
+masonry_type = st.sidebar.selectbox(
+    "Masonry Type",
+    MASONRY_TYPES,
+)
+
+structural_intensity = st.sidebar.slider(
+    "Structural Intensity",
+    min_value=0.5,
+    max_value=2.0,
+    value=1.0,
+    step=0.05,
+)
+
+st.sidebar.divider()
+
+uploaded_stl = st.sidebar.file_uploader(
+    "Upload STL Building Model",
+    type=["stl"],
+)
+
+st.sidebar.divider()
+
+page = st.sidebar.radio(
+    "Navigation",
+    [
+        "Blueprint → 3D",
+        "STL Material Prediction",
+        "Geometry Analysis",
+        "Feature Preview",
+        "About",
+    ],
 )
 
 
@@ -123,7 +179,7 @@ st.markdown(
 # MODEL LOADING
 # ============================================================
 
-@st.cache_resource
+@st.cache_resource(show_spinner="Loading ArchMind ML models...")
 def load_models_from_huggingface():
 
     models = {}
@@ -135,12 +191,10 @@ def load_models_from_huggingface():
 
             model_path = hf_hub_download(
                 repo_id=HF_REPO_ID,
-                filename=filename
+                filename=filename,
             )
 
-            models[target] = joblib.load(
-                model_path
-            )
+            models[target] = joblib.load(model_path)
 
         except Exception as e:
 
@@ -155,827 +209,360 @@ models, model_errors = load_models_from_huggingface()
 
 
 # ============================================================
-# STL LOADER
+# STL LOADING
 # ============================================================
 
 def load_stl_mesh(uploaded_file):
 
-    """
-    Safely load an STL from Streamlit UploadedFile.
-
-    Explicitly specifies STL file type because trimesh
-    cannot reliably infer file type from Streamlit objects.
-    """
+    if uploaded_file is None:
+        raise ValueError("No STL file provided.")
 
     uploaded_file.seek(0)
 
     mesh = trimesh.load(
         uploaded_file,
         file_type="stl",
-        force="mesh"
+        force="mesh",
     )
 
     if isinstance(mesh, trimesh.Scene):
 
         if len(mesh.geometry) == 0:
-
-            raise ValueError(
-                "The uploaded STL contains no usable geometry."
-            )
+            raise ValueError("STL scene contains no geometry.")
 
         mesh = trimesh.util.concatenate(
-            tuple(
-                mesh.geometry.values()
-            )
+            tuple(mesh.geometry.values())
         )
 
     if mesh is None:
-
-        raise ValueError(
-            "No mesh could be extracted."
-        )
+        raise ValueError("Unable to load STL.")
 
     if len(mesh.vertices) == 0:
-
-        raise ValueError(
-            "The STL contains no vertices."
-        )
+        raise ValueError("STL contains no vertices.")
 
     if len(mesh.faces) == 0:
-
-        raise ValueError(
-            "The STL contains no faces."
-        )
+        raise ValueError("STL contains no faces.")
 
     return mesh
 
 
 # ============================================================
-# SIDEBAR
+# UNIT / GEOMETRY HELPERS
 # ============================================================
 
-st.sidebar.title(
-    "⚙️ Project Configuration"
-)
+def safe_div(a, b):
 
-page = st.sidebar.radio(
-    "Navigation",
-    [
-        "Material Prediction",
-        "Geometry Analysis",
-        "Feature Preview",
-        "About"
-    ]
-)
+    if b is None or abs(b) < 1e-9:
+        return 0.0
+
+    return a / b
 
 
-st.sidebar.markdown("---")
+def estimate_floor_count(
+    height_ft,
+    floor_height,
+    max_floors=100,
+):
 
+    if height_ft <= 0 or floor_height <= 0:
+        return 1
 
-building_type = st.sidebar.selectbox(
-    "Building Type",
-    [
-        "Small Residential",
-        "Medium Residential",
-        "Large Residential",
-        "Small Commercial",
-        "Medium Commercial",
-        "Large Commercial",
-        "Industrial",
-        "Institutional"
-    ]
-)
+    estimated = int(round(height_ft / floor_height))
 
+    estimated = max(1, estimated)
 
-foundation_depth = st.sidebar.number_input(
-    "Foundation Depth (ft)",
-    min_value=1.0,
-    max_value=20.0,
-    value=5.0,
-    step=0.5
-)
-
-
-wall_thickness = st.sidebar.number_input(
-    "Wall Thickness (in)",
-    min_value=4.0,
-    max_value=18.0,
-    value=9.0,
-    step=0.5
-)
-
-
-num_floors_input = st.sidebar.number_input(
-    "Number of Floors",
-    min_value=1,
-    max_value=100,
-    value=1,
-    step=1
-)
-
-
-floor_height = st.sidebar.number_input(
-    "Floor Height (ft)",
-    min_value=7.0,
-    max_value=20.0,
-    value=10.0,
-    step=0.5
-)
-
-
-soil_condition = st.sidebar.selectbox(
-    "Soil Condition",
-    [
-        "good",
-        "normal",
-        "weak"
-    ]
-)
-
-
-masonry_type = st.sidebar.selectbox(
-    "Masonry Type",
-    [
-        "brick",
-        "aac",
-        "mixed"
-    ]
-)
-
-
-structural_intensity = st.sidebar.selectbox(
-    "Structural Intensity",
-    [
-        "low",
-        "medium",
-        "high"
-    ]
-)
-
-
-st.sidebar.markdown("---")
-
-
-uploaded_file = st.sidebar.file_uploader(
-    "Upload STL Structural File",
-    type=["stl"]
-)
-
-
-# ============================================================
-# HELPER FUNCTIONS
-# ============================================================
-
-def soil_bearing_capacity(soil):
-
-    mapping = {
-        "good": 300,
-        "normal": 200,
-        "weak": 100
-    }
-
-    return mapping.get(
-        soil,
-        200
+    estimated = min(
+        estimated,
+        max_floors,
     )
 
+    return estimated
 
-# ============================================================
-# GEOMETRY ANALYSIS
-# ============================================================
 
-def analyze_mesh(mesh):
-
-    dims = np.array(
-        mesh.extents,
-        dtype=float
-    )
-
-    dims_sorted = np.sort(dims)
-
-    width = float(
-        dims_sorted[0]
-    )
-
-    depth = float(
-        dims_sorted[1]
-    )
-
-    height = float(
-        dims_sorted[2]
-    )
-
-    footprint_area = (
-        width *
-        depth
-    )
-
-    # --------------------------------------------------------
-    # Volume
-    # --------------------------------------------------------
-
-    try:
-
-        volume = abs(
-            float(mesh.volume)
-        )
-
-    except Exception:
-
-        volume = 0.0
-
-    # --------------------------------------------------------
-    # Surface area
-    # --------------------------------------------------------
-
-    try:
-
-        surface_area = float(
-            mesh.area
-        )
-
-    except Exception:
-
-        surface_area = 0.0
-
-    # --------------------------------------------------------
-    # Bounding box volume
-    # --------------------------------------------------------
-
-    bounding_volume = (
-        width *
-        depth *
-        height
-    )
-
-    if bounding_volume > 0:
-
-        volume_fill_ratio = (
-            volume /
-            bounding_volume
-        )
-
-    else:
-
-        volume_fill_ratio = 0.0
-
-    # --------------------------------------------------------
-    # Expected building height
-    # --------------------------------------------------------
+def calculate_height_metrics(
+    height_ft,
+    selected_floors,
+    floor_height,
+):
 
     expected_height = (
-        float(num_floors_input) *
-        float(floor_height)
+        selected_floors * floor_height
     )
 
-    if expected_height > 0:
-
-        height_ratio = (
-            height /
-            expected_height
-        )
-
-    else:
-
-        height_ratio = 0.0
-
-    # --------------------------------------------------------
-    # HEIGHT VALIDATION
-    #
-    # Normal building tolerance:
-    #
-    # 0.60x -> 1.80x expected height
-    #
-    # Anything above this is considered a serious mismatch.
-    # --------------------------------------------------------
-
-    height_valid = (
-        0.60 <=
-        height_ratio <=
-        1.80
+    ratio = safe_div(
+        height_ft,
+        expected_height,
     )
 
-    # --------------------------------------------------------
-    # Height mismatch severity
-    # --------------------------------------------------------
-
-    if height_ratio < 0.40:
-
-        height_severity = "Severe"
-
-    elif height_ratio < 0.60:
-
-        height_severity = "High"
-
-    elif height_ratio <= 1.80:
-
-        height_severity = "Normal"
-
-    elif height_ratio <= 3.0:
-
-        height_severity = "High"
-
-    else:
-
-        height_severity = "Severe"
-
-    # --------------------------------------------------------
-    # Height / footprint ratio
-    # --------------------------------------------------------
-
-    min_footprint_dimension = min(
-        width,
-        depth
+    estimated_floors = estimate_floor_count(
+        height_ft,
+        floor_height,
     )
 
-    if min_footprint_dimension > 0:
-
-        height_to_footprint_ratio = (
-            height /
-            min_footprint_dimension
-        )
-
-    else:
-
-        height_to_footprint_ratio = 999.0
-
-    # --------------------------------------------------------
-    # Surface / volume
-    # --------------------------------------------------------
-
-    if volume > 0:
-
-        surface_volume_ratio = (
-            surface_area /
-            volume
-        )
-
-    else:
-
-        surface_volume_ratio = 0.0
-
-    # --------------------------------------------------------
-    # Watertight
-    # --------------------------------------------------------
-
-    try:
-
-        is_watertight = bool(
-            mesh.is_watertight
-        )
-
-    except Exception:
-
-        is_watertight = False
-
-    # --------------------------------------------------------
-    # Connected components
-    # --------------------------------------------------------
-
-    try:
-
-        components = mesh.split(
-            only_watertight=False
-        )
-
-        component_count = len(
-            components
-        )
-
-    except Exception:
-
-        component_count = 1
-
-    # --------------------------------------------------------
-    # Complexity
-    # --------------------------------------------------------
-
-    vertex_count = len(
-        mesh.vertices
+    detected_expected_height = (
+        estimated_floors * floor_height
     )
 
-    face_count = len(
-        mesh.faces
+    detected_ratio = safe_div(
+        height_ft,
+        detected_expected_height,
     )
 
-    if footprint_area > 0:
+    return {
+        "expected_height": expected_height,
+        "height_ratio": ratio,
+        "estimated_floors": estimated_floors,
+        "detected_expected_height": detected_expected_height,
+        "detected_ratio": detected_ratio,
+    }
 
-        geometry_density = (
-            face_count /
-            footprint_area
+
+# ============================================================
+# BUILDING CLASSIFICATION
+# ============================================================
+
+def classify_building_geometry(
+    geometry,
+    selected_floors,
+):
+
+    height_ft = geometry["height_ft"]
+    footprint_area = geometry["footprint_area_sqft"]
+    volume_fill = geometry["volume_fill_ratio"]
+    components = geometry["connected_components"]
+    surface_volume_ratio = geometry[
+        "surface_volume_ratio"
+    ]
+
+    estimated_floors = geometry[
+        "estimated_floors"
+    ]
+
+    floor_mismatch = (
+        abs(
+            estimated_floors -
+            selected_floors
         )
+        >= 2
+    )
 
-    else:
+    score = 100
 
-        geometry_density = 0.0
-
-    # --------------------------------------------------------
-    # Vertical distribution
-    # --------------------------------------------------------
-
-    lower_ratio = 0.0
-    middle_ratio = 0.0
-    upper_ratio = 0.0
-
-    try:
-
-        z_values = mesh.vertices[:, 2]
-
-        z_min = float(
-            np.min(z_values)
-        )
-
-        z_max = float(
-            np.max(z_values)
-        )
-
-        z_range = (
-            z_max -
-            z_min
-        )
-
-        if z_range > 0:
-
-            normalized_z = (
-                z_values -
-                z_min
-            ) / z_range
-
-            lower_vertices = np.sum(
-                normalized_z < 0.15
-            )
-
-            middle_vertices = np.sum(
-                (
-                    normalized_z >= 0.15
-                )
-                &
-                (
-                    normalized_z <= 0.85
-                )
-            )
-
-            upper_vertices = np.sum(
-                normalized_z > 0.85
-            )
-
-            total = max(
-                len(z_values),
-                1
-            )
-
-            lower_ratio = (
-                lower_vertices /
-                total
-            )
-
-            middle_ratio = (
-                middle_vertices /
-                total
-            )
-
-            upper_ratio = (
-                upper_vertices /
-                total
-            )
-
-    except Exception:
-
-        pass
-
-    # ========================================================
-    # BUILDING CONFIDENCE
-    # ========================================================
-
-    score = 0.0
     reasons = []
-
-    # --------------------------------------------------------
-    # Footprint
-    # --------------------------------------------------------
-
-    if footprint_area >= 250:
-
-        score += 15
-
-    elif footprint_area >= 100:
-
-        score += 8
-
-        reasons.append(
-            "Small structural footprint"
-        )
-
-    else:
-
-        reasons.append(
-            "Very small footprint"
-        )
-
-    # --------------------------------------------------------
-    # Height
-    # --------------------------------------------------------
-
-    if height >= 8:
-
-        score += 10
-
-    else:
-
-        reasons.append(
-            "Very small model height"
-        )
 
     # --------------------------------------------------------
     # Height / footprint
     # --------------------------------------------------------
 
-    if (
-        0.15 <=
-        height_to_footprint_ratio <=
-        4.0
-    ):
+    aspect_ratio = safe_div(
+        height_ft,
+        math.sqrt(max(footprint_area, 1)),
+    )
 
-        score += 15
-
-    elif (
-        height_to_footprint_ratio <=
-        8.0
-    ):
-
-        score += 5
-
-        reasons.append(
-            "High height-to-footprint ratio"
-        )
-
-    else:
-
+    if aspect_ratio > 8:
+        score -= 30
         reasons.append(
             "Extreme height-to-footprint ratio"
+        )
+
+    elif aspect_ratio > 5:
+        score -= 10
+        reasons.append(
+            "High height-to-footprint ratio"
         )
 
     # --------------------------------------------------------
     # Volume fill
     # --------------------------------------------------------
 
-    if (
-        0.05 <=
-        volume_fill_ratio <=
-        0.90
-    ):
+    if volume_fill < 0.05:
 
-        score += 15
-
-    elif volume_fill_ratio > 0.90:
-
-        score += 5
-
-        reasons.append(
-            "Very dense bounding geometry"
-        )
-
-    else:
+        score -= 30
 
         reasons.append(
             "Very sparse geometry"
         )
 
-    # --------------------------------------------------------
-    # Watertight
-    # --------------------------------------------------------
+    elif volume_fill < 0.15:
 
-    if is_watertight:
-
-        score += 15
-
-    else:
+        score -= 15
 
         reasons.append(
-            "Mesh is not watertight"
+            "Sparse geometry"
         )
+
+    elif volume_fill >= 0.20:
+
+        score += 5
 
     # --------------------------------------------------------
     # Components
     # --------------------------------------------------------
 
-    if component_count <= 20:
-
-        score += 10
-
-    elif component_count <= 50:
-
-        score += 5
-
-        reasons.append(
-            "Multiple disconnected components"
-        )
-
-    else:
-
-        reasons.append(
-            "Very high number of disconnected components"
-        )
-
-    # --------------------------------------------------------
-    # Complexity
-    # --------------------------------------------------------
-
-    if face_count >= 100:
-
-        score += 10
-
-    elif face_count >= 20:
-
-        score += 5
-
-        reasons.append(
-            "Low mesh complexity"
-        )
-
-    else:
-
-        reasons.append(
-            "Very low mesh complexity"
-        )
-
-    # --------------------------------------------------------
-    # Height consistency
-    #
-    # THIS IS THE IMPORTANT FIX.
-    # --------------------------------------------------------
-
-    if height_valid:
-
-        score += 10
-
-    else:
-
-        # Do not award this score.
-        reasons.append(
-            "Model height does not match "
-            "selected floor configuration"
-        )
-
-    # ========================================================
-    # STRONG PENALTIES
-    # ========================================================
-
-    # --------------------------------------------------------
-    # Severe height mismatch
-    # --------------------------------------------------------
-
-    if height_severity == "High":
+    if components >= 15:
 
         score -= 20
 
         reasons.append(
-            "High structural height mismatch"
+            "Large number of disconnected components"
         )
 
-    elif height_severity == "Severe":
+    elif components >= 8:
 
-        score -= 40
+        score -= 10
+
+    # --------------------------------------------------------
+    # Surface-volume behavior
+    # --------------------------------------------------------
+
+    if surface_volume_ratio > 0.20:
+
+        score -= 10
 
         reasons.append(
-            "Severe structural height mismatch"
+            "High surface-to-volume ratio"
         )
 
     # --------------------------------------------------------
-    # Extreme vertical geometry
+    # Important:
+    # FLOOR MISMATCH DOES NOT AUTOMATICALLY MEAN
+    # NON-BUILDING.
     # --------------------------------------------------------
 
-    if height_to_footprint_ratio > 8.0:
-
-        score -= 25
+    if floor_mismatch:
 
         reasons.append(
-            "Extreme vertical geometry"
+            f"Selected {selected_floors} floor(s), "
+            f"geometry suggests ~{estimated_floors}"
         )
 
-    # --------------------------------------------------------
-    # Extremely low fill ratio
-    # --------------------------------------------------------
-
-    if volume_fill_ratio < 0.03:
-
-        score -= 20
-
-        reasons.append(
-            "Extremely sparse object geometry"
-        )
-
-    # --------------------------------------------------------
-    # Large component count
-    # --------------------------------------------------------
-
-    if component_count > 50:
-
-        score -= 15
-
-        reasons.append(
-            "Excessive disconnected geometry"
-        )
-
-    # --------------------------------------------------------
-    # Clamp
-    # --------------------------------------------------------
-
-    geometry_score = max(
-        0.0,
-        min(
-            100.0,
-            score
-        )
+    score = max(
+        0,
+        min(100, score),
     )
-
-    # ========================================================
-    # FINAL BUILDING CONFIDENCE
-    # ========================================================
-
-    building_confidence = geometry_score
-
-    # --------------------------------------------------------
-    # HARD STRUCTURAL GATE
-    #
-    # A severe mismatch cannot be "Likely Building".
-    # --------------------------------------------------------
-
-    if height_severity == "Severe":
-
-        building_confidence = min(
-            building_confidence,
-            45.0
-        )
-
-    elif height_severity == "High":
-
-        building_confidence = min(
-            building_confidence,
-            65.0
-        )
-
-    # Extreme geometry hard cap
-    if height_to_footprint_ratio > 8.0:
-
-        building_confidence = min(
-            building_confidence,
-            45.0
-        )
 
     # --------------------------------------------------------
     # Classification
     # --------------------------------------------------------
 
-    if building_confidence >= 75:
+    if score >= 70:
 
-        classification = (
-            "Likely Building"
-        )
+        classification = "Likely Building"
 
-    elif building_confidence >= 50:
+    elif score >= 50:
 
-        classification = (
-            "Uncertain Structure"
-        )
+        classification = "Uncertain Structure"
 
     else:
 
-        classification = (
-            "Likely Non-Building Object"
-        )
+        classification = "Likely Non-Building Object"
 
-    # --------------------------------------------------------
-    # Prediction eligibility
-    # --------------------------------------------------------
+    return {
+        "confidence": score,
+        "classification": classification,
+        "reasons": reasons,
+        "floor_mismatch": floor_mismatch,
+    }
 
-    prediction_allowed = (
-        height_valid
-        and
-        height_severity == "Normal"
-        and
-        height_to_footprint_ratio <= 8.0
-        and
-        building_confidence >= 50
+
+# ============================================================
+# GEOMETRY ANALYSIS
+# ============================================================
+
+def analyze_geometry(
+    mesh,
+    selected_floors,
+    floor_height,
+):
+
+    bounds = mesh.bounds
+
+    dimensions = (
+        bounds[1] -
+        bounds[0]
+    )
+
+    dimensions = np.asarray(
+        dimensions,
+        dtype=float,
     )
 
     # --------------------------------------------------------
-    # Final result
+    # We don't assume STL axis orientation.
+    # Largest dimension is treated as candidate vertical.
     # --------------------------------------------------------
 
-    return {
+    sorted_dims = np.sort(
+        dimensions
+    )
 
-        "width_ft":
-            width,
+    footprint_x = float(
+        sorted_dims[0]
+    )
 
-        "depth_ft":
-            depth,
+    footprint_y = float(
+        sorted_dims[1]
+    )
 
-        "height_ft":
-            height,
+    height = float(
+        sorted_dims[2]
+    )
+
+    footprint_area_model_units = (
+        footprint_x *
+        footprint_y
+    )
+
+    # Current STL workflow assumes
+    # model units correspond approximately to feet.
+    footprint_area_sqft = float(
+        footprint_area_model_units
+    )
+
+    volume = float(
+        abs(mesh.volume)
+    )
+
+    surface_area = float(
+        mesh.area
+    )
+
+    bounding_volume = float(
+        np.prod(dimensions)
+    )
+
+    volume_fill_ratio = safe_div(
+        volume,
+        bounding_volume,
+    )
+
+    surface_volume_ratio = safe_div(
+        surface_area,
+        max(volume, 1e-6),
+    )
+
+    components = len(
+        mesh.split(
+            only_watertight=False
+        )
+    )
+
+    height_metrics = calculate_height_metrics(
+        height,
+        selected_floors,
+        floor_height,
+    )
+
+    geometry = {
+        "dimensions": dimensions,
+
+        "footprint_x_ft": footprint_x,
+        "footprint_y_ft": footprint_y,
+
+        "height_ft": height,
 
         "footprint_area_sqft":
-            footprint_area,
+            footprint_area_sqft,
 
         "volume":
             volume,
@@ -989,247 +576,430 @@ def analyze_mesh(mesh):
         "volume_fill_ratio":
             volume_fill_ratio,
 
-        "expected_height":
-            expected_height,
-
-        "height_ratio":
-            height_ratio,
-
-        "height_valid":
-            height_valid,
-
-        "height_severity":
-            height_severity,
-
-        "height_to_footprint_ratio":
-            height_to_footprint_ratio,
-
         "surface_volume_ratio":
             surface_volume_ratio,
 
-        "is_watertight":
-            is_watertight,
+        "connected_components":
+            components,
 
-        "component_count":
-            component_count,
+        "watertight":
+            bool(mesh.is_watertight),
 
-        "vertex_count":
-            vertex_count,
+        "vertices":
+            len(mesh.vertices),
 
-        "face_count":
-            face_count,
+        "faces":
+            len(mesh.faces),
 
-        "geometry_density":
-            geometry_density,
+        "estimated_floors":
+            height_metrics["estimated_floors"],
 
-        "lower_vertex_ratio":
-            lower_ratio,
+        "expected_height":
+            height_metrics["expected_height"],
 
-        "middle_vertex_ratio":
-            middle_ratio,
+        "height_ratio":
+            height_metrics["height_ratio"],
 
-        "upper_vertex_ratio":
-            upper_ratio,
+        "detected_expected_height":
+            height_metrics[
+                "detected_expected_height"
+            ],
 
-        "geometry_score":
-            geometry_score,
+        "detected_ratio":
+            height_metrics[
+                "detected_ratio"
+            ],
+    }
 
-        "building_confidence":
-            building_confidence,
+    classification = classify_building_geometry(
+        geometry,
+        selected_floors,
+    )
 
-        "classification":
-            classification,
+    geometry.update(
+        classification
+    )
 
-        "prediction_allowed":
-            prediction_allowed,
+    return geometry
 
-        "reasons":
-            reasons
+
+# ============================================================
+# BLUEPRINT PROCESSING
+# ============================================================
+
+def preprocess_blueprint(image):
+
+    img = np.array(
+        image.convert("RGB")
+    )
+
+    gray = cv2.cvtColor(
+        img,
+        cv2.COLOR_RGB2GRAY,
+    )
+
+    gray = cv2.GaussianBlur(
+        gray,
+        (5, 5),
+        0,
+    )
+
+    binary = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        21,
+        5,
+    )
+
+    kernel = np.ones(
+        (3, 3),
+        np.uint8,
+    )
+
+    binary = cv2.morphologyEx(
+        binary,
+        cv2.MORPH_CLOSE,
+        kernel,
+        iterations=2,
+    )
+
+    return img, gray, binary
+
+
+def detect_floorplan_bounds(binary):
+
+    contours, _ = cv2.findContours(
+        binary,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+
+    if not contours:
+        return None
+
+    contours = sorted(
+        contours,
+        key=cv2.contourArea,
+        reverse=True,
+    )
+
+    largest = contours[0]
+
+    x, y, w, h = cv2.boundingRect(
+        largest
+    )
+
+    image_area = (
+        binary.shape[0] *
+        binary.shape[1]
+    )
+
+    contour_area = cv2.contourArea(
+        largest
+    )
+
+    if contour_area < image_area * 0.02:
+        return None
+
+    return {
+        "x": x,
+        "y": y,
+        "width_px": w,
+        "height_px": h,
+        "area_px": contour_area,
     }
 
 
-# ============================================================
-# FEATURE EXTRACTION
-# ============================================================
+def create_building_mesh(
+    width_ft,
+    depth_ft,
+    num_floors,
+    floor_height,
+    wall_thickness_in,
+):
 
-def estimate_features(geometry):
-
-    width = geometry[
-        "width_ft"
-    ]
-
-    depth = geometry[
-        "depth_ft"
-    ]
-
-    floor_area = (
-        width *
-        depth
+    wall_t = (
+        wall_thickness_in /
+        12.0
     )
 
-    num_floors = max(
-        1,
-        int(num_floors_input)
-    )
-
-    # --------------------------------------------------------
-    # Built-up area
-    # --------------------------------------------------------
-
-    built_up_area = (
-        floor_area *
+    total_height = (
         num_floors *
-        1.05
-    )
-
-    # --------------------------------------------------------
-    # Wall length
-    # --------------------------------------------------------
-
-    perimeter = (
-        2 *
-        (
-            width +
-            depth
-        )
-    )
-
-    internal_wall_length = (
-        math.sqrt(
-            max(
-                floor_area,
-                1
-            )
-        )
-        *
-        0.35
-    )
-
-    wall_length = (
-        perimeter +
-        internal_wall_length
-    ) * num_floors
-
-    # --------------------------------------------------------
-    # Gross wall area
-    # --------------------------------------------------------
-
-    gross_wall_area = (
-        wall_length *
         floor_height
     )
 
     # --------------------------------------------------------
-    # Openings
+    # Main outer walls
     # --------------------------------------------------------
 
-    door_area = (
-        gross_wall_area *
-        0.035
+    wall_meshes = []
+
+    wall_meshes.append(
+        trimesh.creation.box(
+            extents=[
+                width_ft,
+                wall_t,
+                total_height,
+            ]
+        )
     )
 
-    window_area = (
-        gross_wall_area *
-        0.10
+    wall_meshes[-1].apply_translation(
+        [
+            0,
+            -depth_ft / 2,
+            total_height / 2,
+        ]
     )
 
-    max_opening_area = (
-        gross_wall_area *
-        0.30
+    wall_meshes.append(
+        trimesh.creation.box(
+            extents=[
+                width_ft,
+                wall_t,
+                total_height,
+            ]
+        )
     )
 
-    total_openings = (
-        door_area +
-        window_area
+    wall_meshes[-1].apply_translation(
+        [
+            0,
+            depth_ft / 2,
+            total_height / 2,
+        ]
     )
 
-    if total_openings > max_opening_area:
+    wall_meshes.append(
+        trimesh.creation.box(
+            extents=[
+                wall_t,
+                depth_ft,
+                total_height,
+            ]
+        )
+    )
 
-        scale = (
-            max_opening_area /
-            max(
-                total_openings,
-                1
-            )
+    wall_meshes[-1].apply_translation(
+        [
+            -width_ft / 2,
+            0,
+            total_height / 2,
+        ]
+    )
+
+    wall_meshes.append(
+        trimesh.creation.box(
+            extents=[
+                wall_t,
+                depth_ft,
+                total_height,
+            ]
+        )
+    )
+
+    wall_meshes[-1].apply_translation(
+        [
+            width_ft / 2,
+            0,
+            total_height / 2,
+        ]
+    )
+
+    # --------------------------------------------------------
+    # Floor slabs
+    # --------------------------------------------------------
+
+    slab_thickness = 0.5
+
+    for floor in range(
+        1,
+        num_floors + 1,
+    ):
+
+        z = (
+            floor *
+            floor_height
         )
 
-        door_area *= scale
-        window_area *= scale
+        slab = trimesh.creation.box(
+            extents=[
+                width_ft,
+                depth_ft,
+                slab_thickness,
+            ]
+        )
 
-    # --------------------------------------------------------
-    # Foundation
-    # --------------------------------------------------------
+        slab.apply_translation(
+            [
+                0,
+                0,
+                z,
+            ]
+        )
 
-    foundation_area = (
-        floor_area *
-        1.05
-    )
-
-    # --------------------------------------------------------
-    # Slab
-    # --------------------------------------------------------
-
-    slab_area = (
-        floor_area *
-        num_floors
-    )
-
-    slab_thickness = 5.0
+        wall_meshes.append(
+            slab
+        )
 
     # --------------------------------------------------------
     # Roof
     # --------------------------------------------------------
 
-    roof_area = (
+    roof = trimesh.creation.box(
+        extents=[
+            width_ft,
+            depth_ft,
+            slab_thickness,
+        ]
+    )
+
+    roof.apply_translation(
+        [
+            0,
+            0,
+            total_height,
+        ]
+    )
+
+    wall_meshes.append(
+        roof
+    )
+
+    # --------------------------------------------------------
+    # Simple internal partition
+    # --------------------------------------------------------
+
+    if width_ft > 20:
+
+        partition = trimesh.creation.box(
+            extents=[
+                wall_t,
+                depth_ft - 2 * wall_t,
+                total_height,
+            ]
+        )
+
+        partition.apply_translation(
+            [
+                0,
+                0,
+                total_height / 2,
+            ]
+        )
+
+        wall_meshes.append(
+            partition
+        )
+
+    return trimesh.util.concatenate(
+        wall_meshes
+    )
+
+
+def export_mesh_stl(mesh):
+
+    buffer = io.BytesIO()
+
+    mesh.export(
+        buffer,
+        file_type="stl",
+    )
+
+    buffer.seek(0)
+
+    return buffer.getvalue()
+
+
+# ============================================================
+# FEATURE GENERATION
+# ============================================================
+
+def build_prediction_features(
+    geometry,
+    num_floors,
+    floor_height,
+    foundation_depth,
+    wall_thickness,
+    soil_condition,
+    masonry_type,
+    structural_intensity,
+):
+
+    floor_area = geometry[
+        "footprint_area_sqft"
+    ]
+
+    built_up_area = (
         floor_area *
-        1.05
+        num_floors
     )
+
+    wall_length = (
+        2 *
+        (
+            geometry["footprint_x_ft"] +
+            geometry["footprint_y_ft"]
+        )
+        *
+        num_floors
+    )
+
+    foundation_area = floor_area
+
+    wall_height = (
+        floor_height
+    )
+
+    slab_area = floor_area
+
+    roof_area = floor_area
 
     # --------------------------------------------------------
-    # Concrete
+    # Approximate opening areas
     # --------------------------------------------------------
 
-    slab_volume = (
-        slab_area *
-        (
-            slab_thickness /
-            12
-        )
-    )
-
-    foundation_volume = (
-        foundation_area *
-        (
-            foundation_depth /
-            12
-        )
-    )
-
-    frame_volume = (
+    door_area = (
         built_up_area *
-        0.015
+        0.025
     )
 
-    concrete_volume_ft3 = (
-        slab_volume +
-        foundation_volume +
-        frame_volume
-    )
-
-    concrete_volume_m3 = (
-        concrete_volume_ft3 *
-        0.0283168
+    window_area = (
+        built_up_area *
+        0.12
     )
 
     # --------------------------------------------------------
-    # Feature dictionary
+    # Approximate room count
     # --------------------------------------------------------
 
-    return {
+    num_rooms_per_floor = max(
+        2,
+        int(
+            round(
+                floor_area /
+                250
+            )
+        ),
+    )
 
-        "building_type":
-            building_type,
+    num_rooms = (
+        num_rooms_per_floor *
+        num_floors
+    )
 
+    concrete_volume = (
+        geometry["volume"]
+        if geometry["volume"] > 0
+        else
+        built_up_area *
+        0.18 /
+        35.3147
+    )
+
+    features = {
         "floor_area_sqft":
             floor_area,
 
@@ -1240,13 +1010,7 @@ def estimate_features(geometry):
             num_floors,
 
         "num_rooms":
-            max(
-                1,
-                int(
-                    floor_area /
-                    250
-                )
-            ),
+            num_rooms,
 
         "wall_length_ft":
             wall_length,
@@ -1255,7 +1019,7 @@ def estimate_features(geometry):
             wall_thickness,
 
         "wall_height_ft":
-            floor_height,
+            wall_height,
 
         "foundation_depth_ft":
             foundation_depth,
@@ -1275,38 +1039,36 @@ def estimate_features(geometry):
         "roof_area_sqft":
             roof_area,
 
-        "slab_thickness_in":
-            slab_thickness,
-
         "concrete_volume_m3":
-            concrete_volume_m3,
+            concrete_volume,
 
-        "soil_condition":
-            soil_condition,
+        "slab_thickness_in":
+            6.0,
 
         "soil_bearing_capacity_kpa":
-            soil_bearing_capacity(
-                soil_condition
-            ),
+            {
+                "weak": 100,
+                "normal": 180,
+                "good": 300,
+            }[soil_condition],
 
         "structural_intensity":
             structural_intensity,
-
-        "masonry_type":
-            masonry_type
     }
+
+    return pd.DataFrame(
+        [[features[f] for f in FEATURES]],
+        columns=FEATURES,
+    )
 
 
 # ============================================================
 # MATERIAL PREDICTION
 # ============================================================
 
-def predict_materials(features):
-
-    df = pd.DataFrame(
-        [features],
-        columns=FEATURES
-    )
+def predict_materials(
+    feature_df,
+):
 
     predictions = {}
 
@@ -1314,13 +1076,13 @@ def predict_materials(features):
 
         try:
 
-            prediction = model.predict(
-                df
+            value = model.predict(
+                feature_df
             )[0]
 
             predictions[target] = max(
-                0.0,
-                float(prediction)
+                0,
+                float(value),
             )
 
         except Exception as e:
@@ -1328,54 +1090,532 @@ def predict_materials(features):
             predictions[target] = None
 
             st.error(
-                f"Prediction failed for "
-                f"{target}: {e}"
+                f"{target} prediction failed: {e}"
             )
 
     return predictions
 
 
 # ============================================================
-# MATERIAL PREDICTION PAGE
+# BUILDING CLASSIFICATION UI
 # ============================================================
 
-if page == "Material Prediction":
+def show_building_classification(
+    geometry,
+):
+
+    st.subheader(
+        "🏢 Building Classification"
+    )
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+
+        st.metric(
+            "Building Confidence",
+            f"{geometry['confidence']:.0f}%",
+        )
+
+    with col2:
+
+        st.metric(
+            "Classification",
+            geometry["classification"],
+        )
+
+    with col3:
+
+        st.metric(
+            "Estimated Floors",
+            geometry["estimated_floors"],
+        )
+
+    if geometry["classification"] == "Likely Building":
+
+        st.success(
+            "🏢 Geometry is structurally plausible "
+            "as a building."
+        )
+
+    elif geometry["classification"] == "Uncertain Structure":
+
+        st.warning(
+            "⚠️ Geometry has mixed building/non-building "
+            "characteristics."
+        )
+
+    else:
+
+        st.error(
+            "🚫 Geometry is unlikely to represent "
+            "a conventional building."
+        )
+
+    if geometry["reasons"]:
+
+        with st.expander(
+            "🔎 Classification reasoning"
+        ):
+
+            for reason in geometry["reasons"]:
+
+                st.write(
+                    f"• {reason}"
+                )
+
+
+# ============================================================
+# FLOOR ESTIMATION UI
+# ============================================================
+
+def show_floor_estimation(
+    geometry,
+    selected_floors,
+    floor_height,
+):
+
+    estimated = geometry[
+        "estimated_floors"
+    ]
+
+    height = geometry[
+        "height_ft"
+    ]
+
+    expected_selected = geometry[
+        "expected_height"
+    ]
+
+    ratio = geometry[
+        "height_ratio"
+    ]
+
+    difference = abs(
+        height -
+        expected_selected
+    )
+
+    st.subheader(
+        "🏢 Automatic Floor Estimation"
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    with c1:
+
+        st.metric(
+            "Model Height",
+            f"{height:.1f} ft",
+        )
+
+    with c2:
+
+        st.metric(
+            "Selected Floors",
+            selected_floors,
+        )
+
+    with c3:
+
+        st.metric(
+            "Detected Floors",
+            estimated,
+        )
+
+    with c4:
+
+        st.metric(
+            "Height Ratio",
+            f"{ratio:.2f}×",
+        )
+
+    # --------------------------------------------------------
+    # Mismatch threshold
+    # --------------------------------------------------------
+
+    mismatch = (
+        abs(
+            estimated -
+            selected_floors
+        )
+        >= 2
+    )
+
+    if mismatch:
+
+        st.warning(
+            f"⚠️ The geometry suggests approximately "
+            f"**{estimated} floors**, but the project "
+            f"configuration currently has **{selected_floors} floors**."
+        )
+
+        st.info(
+            f"Model height: **{height:.1f} ft**  \n"
+            f"Selected configuration height: "
+            f"**{expected_selected:.1f} ft**  \n"
+            f"Difference: **{difference:.1f} ft**"
+        )
+
+        st.write(
+            "ArchMind will not silently change your project "
+            "configuration. Confirm the detected floor count "
+            "before continuing to material prediction."
+        )
+
+        confirm_key = (
+            f"floor_confirmed_{estimated}"
+        )
+
+        if confirm_key not in st.session_state:
+
+            st.session_state[
+                confirm_key
+            ] = False
+
+        if st.button(
+            f"✅ Use detected {estimated} floors",
+            key=f"use_detected_{estimated}",
+        ):
+
+            st.session_state[
+                "confirmed_floors"
+            ] = estimated
+
+            st.session_state[
+                "floor_confirmation_active"
+            ] = True
+
+            st.rerun()
+
+        if st.button(
+            f"↩️ Keep selected {selected_floors} floors",
+            key=f"keep_selected_{selected_floors}",
+        ):
+
+            st.session_state[
+                "confirmed_floors"
+            ] = selected_floors
+
+            st.session_state[
+                "floor_confirmation_active"
+            ] = False
+
+            st.session_state[
+                "keep_selected_override"
+            ] = True
+
+            st.rerun()
+
+        return False
+
+    # --------------------------------------------------------
+    # Close enough
+    # --------------------------------------------------------
+
+    height_valid = (
+        0.60 <= ratio <= 1.80
+    )
+
+    if height_valid:
+
+        st.success(
+            f"✅ Geometry height is consistent "
+            f"with the selected {selected_floors} floor(s)."
+        )
+
+        st.session_state[
+            "confirmed_floors"
+        ] = selected_floors
+
+        return True
+
+    else:
+
+        st.warning(
+            "⚠️ Height is outside the normal "
+            "configuration range."
+        )
+
+        return False
+
+
+# ============================================================
+# GEOMETRY TABLE
+# ============================================================
+
+def show_geometry_metrics(
+    geometry,
+):
+
+    st.subheader(
+        "📐 Geometry Analysis"
+    )
+
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+
+        st.metric(
+            "Footprint",
+            f"{geometry['footprint_area_sqft']:,.0f} sqft",
+        )
+
+    with c2:
+
+        st.metric(
+            "Model Height",
+            f"{geometry['height_ft']:.1f} ft",
+        )
+
+    with c3:
+
+        st.metric(
+            "Estimated Floors",
+            geometry["estimated_floors"],
+        )
+
+    c4, c5, c6 = st.columns(3)
+
+    with c4:
+
+        st.metric(
+            "Volume Fill",
+            f"{geometry['volume_fill_ratio']:.2f}",
+        )
+
+    with c5:
+
+        st.metric(
+            "Components",
+            geometry["connected_components"],
+        )
+
+    with c6:
+
+        st.metric(
+            "Faces",
+            f"{geometry['faces']:,}",
+        )
+
+    st.divider()
+
+    data = {
+        "Metric": [
+            "Footprint X",
+            "Footprint Y",
+            "Model Height",
+            "Volume",
+            "Surface Area",
+            "Bounding Volume",
+            "Volume Fill Ratio",
+            "Surface / Volume",
+            "Connected Components",
+            "Watertight",
+            "Vertices",
+            "Faces",
+            "Estimated Floors",
+        ],
+        "Value": [
+            f"{geometry['footprint_x_ft']:.2f} ft",
+            f"{geometry['footprint_y_ft']:.2f} ft",
+            f"{geometry['height_ft']:.2f} ft",
+            f"{geometry['volume']:,.2f}",
+            f"{geometry['surface_area']:,.2f}",
+            f"{geometry['bounding_volume']:,.2f}",
+            f"{geometry['volume_fill_ratio']:.3f}",
+            f"{geometry['surface_volume_ratio']:.4f}",
+            geometry["connected_components"],
+            "Yes"
+            if geometry["watertight"]
+            else "No",
+            f"{geometry['vertices']:,}",
+            f"{geometry['faces']:,}",
+            geometry["estimated_floors"],
+        ],
+    }
+
+    st.dataframe(
+        pd.DataFrame(data),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+# ============================================================
+# BLUEPRINT → 3D
+# ============================================================
+
+if page == "Blueprint → 3D":
 
     st.header(
-        "📐 Material Prediction"
+        "🖼️ Blueprint → 3D Reconstruction"
     )
 
     st.write(
-        "Upload a structural STL model and ArchMind will "
-        "extract geometry, validate building plausibility, "
-        "generate ML features, and estimate construction materials."
+        "Upload a 2D floor plan and ArchMind will "
+        "extract the primary footprint and generate "
+        "a procedural 3D building model."
     )
 
-    if uploaded_file is None:
+    blueprint = st.file_uploader(
+        "Upload Blueprint / Floor Plan",
+        type=[
+            "png",
+            "jpg",
+            "jpeg",
+        ],
+        key="blueprint",
+    )
 
-        st.info(
-            "👆 Upload an STL file from the sidebar to begin."
+    known_width = st.number_input(
+        "Known Building Width (ft)",
+        min_value=5.0,
+        max_value=500.0,
+        value=30.0,
+        step=1.0,
+    )
+
+    if blueprint:
+
+        image = Image.open(
+            blueprint
         )
 
-        st.markdown(
-            """
-            ### V2.4.1 Intelligence Pipeline
+        st.image(
+            image,
+            caption="Uploaded Blueprint",
+            use_container_width=True,
+        )
 
-            ```text
-            STL
-             ↓
-            Geometry Extraction
-             ↓
-            Building Plausibility Analysis
-             ↓
-            Structural Validation
-             ↓
-            Feature Engineering
-             ↓
-            ML Prediction
-            ```
-            """
+        original, gray, binary = (
+            preprocess_blueprint(image)
+        )
 
+        bounds = detect_floorplan_bounds(
+            binary
+        )
+
+        if bounds is None:
+
+            st.error(
+                "Could not detect a clear floor-plan boundary."
+            )
+
+        else:
+
+            detected_width_px = bounds[
+                "width_px"
+            ]
+
+            detected_height_px = bounds[
+                "height_px"
+            ]
+
+            scale = (
+                known_width /
+                detected_width_px
+            )
+
+            detected_depth = (
+                detected_height_px *
+                scale
+            )
+
+            st.success(
+                "Blueprint boundary detected."
+            )
+
+            c1, c2, c3 = st.columns(3)
+
+            with c1:
+
+                st.metric(
+                    "Detected Width",
+                    f"{known_width:.1f} ft",
+                )
+
+            with c2:
+
+                st.metric(
+                    "Estimated Depth",
+                    f"{detected_depth:.1f} ft",
+                )
+
+            with c3:
+
+                st.metric(
+                    "Floors",
+                    num_floors_input,
+                )
+
+            if st.button(
+                "🏗️ Generate 3D Building",
+                type="primary",
+            ):
+
+                building_mesh = create_building_mesh(
+                    known_width,
+                    detected_depth,
+                    num_floors_input,
+                    floor_height,
+                    wall_thickness,
+                )
+
+                st.session_state[
+                    "generated_mesh"
+                ] = building_mesh
+
+                st.success(
+                    "3D building geometry generated."
+                )
+
+        if (
+            "generated_mesh"
+            in st.session_state
+        ):
+
+            mesh = st.session_state[
+                "generated_mesh"
+            ]
+
+            st.info(
+                "The generated geometry is procedural. "
+                "It is intended for MVP reconstruction "
+                "and material-intelligence workflows."
+            )
+
+            st.metric(
+                "Generated Height",
+                f"{mesh.extents[2]:.1f} ft",
+            )
+
+            stl_bytes = export_mesh_stl(
+                mesh
+            )
+
+            st.download_button(
+                "⬇️ Download Generated STL",
+                data=stl_bytes,
+                file_name="archmind_generated_building.stl",
+                mime="model/stl",
+            )
+
+
+# ============================================================
+# STL MATERIAL PREDICTION
+# ============================================================
+
+elif page == "STL Material Prediction":
+
+    st.header(
+        "🧱 STL Material Prediction"
+    )
+
+    if uploaded_stl is None:
+
+        st.info(
+            "Upload an STL building model from the sidebar."
         )
 
     else:
@@ -1383,394 +1623,226 @@ if page == "Material Prediction":
         try:
 
             mesh = load_stl_mesh(
-                uploaded_file
+                uploaded_stl
             )
 
-        except Exception as e:
-
-            st.error(
-                f"Unable to load STL file: {e}"
+            geometry = analyze_geometry(
+                mesh,
+                num_floors_input,
+                floor_height,
             )
 
-            st.stop()
-
-        geometry = analyze_mesh(
-            mesh
-        )
-
-        features = estimate_features(
-            geometry
-        )
-
-        # ----------------------------------------------------
-        # Geometry metrics
-        # ----------------------------------------------------
-
-        st.subheader(
-            "🔍 Geometry Analysis"
-        )
-
-        c1, c2, c3, c4 = st.columns(4)
-
-        c1.metric(
-            "Footprint",
-            f"{geometry['footprint_area_sqft']:,.0f} sqft"
-        )
-
-        c2.metric(
-            "Floors",
-            f"{num_floors_input}"
-        )
-
-        c3.metric(
-            "Model Height",
-            f"{geometry['height_ft']:,.1f} ft"
-        )
-
-        c4.metric(
-            "Building Confidence",
-            f"{geometry['building_confidence']:.0f}%"
-        )
-
-        # ----------------------------------------------------
-        # Classification
-        # ----------------------------------------------------
-
-        classification = (
-            geometry["classification"]
-        )
-
-        if classification == "Likely Building":
-
-            st.success(
-                "🏢 Geometry classification: "
-                f"**{classification}**"
+            show_building_classification(
+                geometry
             )
 
-        elif classification == "Uncertain Structure":
+            st.divider()
 
-            st.warning(
-                "⚠️ Geometry classification: "
-                f"**{classification}**"
+            floor_configuration_ok = (
+                show_floor_estimation(
+                    geometry,
+                    num_floors_input,
+                    floor_height,
+                )
             )
 
-        else:
+            st.divider()
 
-            st.error(
-                "🚫 Geometry classification: "
-                f"**{classification}**"
+            show_geometry_metrics(
+                geometry
             )
 
-        # ----------------------------------------------------
-        # Geometry details
-        # ----------------------------------------------------
+            st.divider()
 
-        with st.expander(
-            "🔎 View extracted geometry details"
-        ):
+            # ------------------------------------------------
+            # Prediction gate
+            # ------------------------------------------------
 
-            d1, d2 = st.columns(2)
-
-            with d1:
-
-                st.write(
-                    f"**Width:** "
-                    f"{geometry['width_ft']:.2f} ft"
+            selected_for_prediction = (
+                st.session_state.get(
+                    "confirmed_floors",
+                    num_floors_input,
                 )
-
-                st.write(
-                    f"**Depth:** "
-                    f"{geometry['depth_ft']:.2f} ft"
-                )
-
-                st.write(
-                    f"**Height:** "
-                    f"{geometry['height_ft']:.2f} ft"
-                )
-
-                st.write(
-                    f"**Volume:** "
-                    f"{geometry['volume']:,.2f}"
-                )
-
-                st.write(
-                    f"**Surface Area:** "
-                    f"{geometry['surface_area']:,.2f}"
-                )
-
-            with d2:
-
-                st.write(
-                    f"**Bounding Volume:** "
-                    f"{geometry['bounding_volume']:,.2f}"
-                )
-
-                st.write(
-                    f"**Volume Fill Ratio:** "
-                    f"{geometry['volume_fill_ratio']:.3f}"
-                )
-
-                st.write(
-                    f"**Height / Footprint:** "
-                    f"{geometry['height_to_footprint_ratio']:.3f}"
-                )
-
-                st.write(
-                    f"**Components:** "
-                    f"{geometry['component_count']}"
-                )
-
-                st.write(
-                    f"**Faces:** "
-                    f"{geometry['face_count']:,}"
-                )
-
-                st.write(
-                    f"**Watertight:** "
-                    f"{'Yes' if geometry['is_watertight'] else 'No'}"
-                )
-
-        # ----------------------------------------------------
-        # Structural validation
-        # ----------------------------------------------------
-
-        st.subheader(
-            "🏗️ Structural Geometry Validation"
-        )
-
-        h1, h2, h3 = st.columns(3)
-
-        h1.metric(
-            "Model Height",
-            f"{geometry['height_ft']:.1f} ft"
-        )
-
-        h2.metric(
-            "Expected Height",
-            f"{geometry['expected_height']:.1f} ft"
-        )
-
-        h3.metric(
-            "Height Ratio",
-            f"{geometry['height_ratio']:.2f}×"
-        )
-
-        if geometry["height_valid"]:
-
-            st.success(
-                "✅ Model height is consistent with "
-                "the selected floor configuration."
             )
 
-        else:
+            classification_ok = (
+                geometry["classification"]
+                !=
+                "Likely Non-Building Object"
+            )
 
-            if geometry["height_severity"] == "Severe":
+            floor_difference = abs(
+                geometry["estimated_floors"]
+                -
+                selected_for_prediction
+            )
+
+            final_height_ratio = safe_div(
+                geometry["height_ft"],
+                (
+                    selected_for_prediction *
+                    floor_height
+                ),
+            )
+
+            final_height_valid = (
+                0.60 <= final_height_ratio <= 1.80
+            )
+
+            prediction_ready = (
+                classification_ok
+                and
+                floor_difference < 2
+                and
+                final_height_valid
+            )
+
+            if not classification_ok:
 
                 st.error(
-                    "🚨 Severe geometry mismatch detected."
+                    "🚫 Material prediction paused because "
+                    "the geometry is currently classified "
+                    "as likely non-building."
+                )
+
+            elif not prediction_ready:
+
+                st.warning(
+                    "⚠️ Material prediction is waiting for "
+                    "a valid floor configuration."
                 )
 
             else:
 
-                st.warning(
-                    "⚠️ Model height does not closely "
-                    "match the selected floor configuration."
+                st.success(
+                    f"✅ Geometry validated for approximately "
+                    f"{selected_for_prediction} floor(s). "
+                    "Material prediction is ready."
                 )
 
-            difference = abs(
-                geometry["height_ft"]
-                -
-                geometry["expected_height"]
-            )
-            
-            st.write(
-                f"""
-            **Model:** {geometry['height_ft']:.1f} ft
-            
-            **Expected:** {geometry['expected_height']:.1f} ft
-            
-            **Difference:** {difference:.1f} ft
-            """
-            )
+            # ------------------------------------------------
+            # Prediction
+            # ------------------------------------------------
 
-        # ----------------------------------------------------
-        # Geometry intelligence
-        # ----------------------------------------------------
+            if prediction_ready:
 
-        st.subheader(
-            "🧠 Geometry Intelligence"
-        )
+                st.subheader(
+                    "🤖 Material Intelligence"
+                )
 
-        g1, g2, g3, g4 = st.columns(4)
+                feature_df = build_prediction_features(
+                    geometry,
+                    selected_for_prediction,
+                    floor_height,
+                    foundation_depth,
+                    wall_thickness,
+                    soil_condition,
+                    masonry_type,
+                    structural_intensity,
+                )
 
-        g1.metric(
-            "Volume Fill",
-            f"{geometry['volume_fill_ratio']:.2f}"
-        )
+                with st.expander(
+                    "🔎 Feature Preview"
+                ):
 
-        g2.metric(
-            "Components",
-            geometry["component_count"]
-        )
-
-        g3.metric(
-            "Watertight",
-            "Yes"
-            if geometry["is_watertight"]
-            else "No"
-        )
-
-        g4.metric(
-            "Faces",
-            f"{geometry['face_count']:,}"
-        )
-
-        # ----------------------------------------------------
-        # Validation observations
-        # ----------------------------------------------------
-
-        if geometry["reasons"]:
-
-            with st.expander(
-                "⚠️ Validation observations"
-            ):
-
-                for reason in geometry["reasons"]:
-
-                    st.write(
-                        f"• {reason}"
+                    st.dataframe(
+                        feature_df,
+                        use_container_width=True,
                     )
 
-        # ----------------------------------------------------
-        # Prediction
-        # ----------------------------------------------------
+                if st.button(
+                    "🚀 Run V2.5 Material Prediction",
+                    type="primary",
+                ):
 
-        st.markdown("---")
+                    if model_errors:
 
-        if not geometry["prediction_allowed"]:
-
-            st.error(
-                """
-                🚫 **ML prediction paused**
-
-                ArchMind's geometry intelligence layer has
-                determined that the uploaded model is not
-                reliable enough for material prediction.
-
-                Please verify:
-
-                - The STL represents a building
-                - The STL is correctly scaled
-                - The selected floor count is correct
-                - The selected floor height is correct
-                """
-            )
-
-        else:
-
-            if len(models) < 4:
-
-                st.error(
-                    "Not all ML models could be loaded."
-                )
-
-                if model_errors:
-
-                    with st.expander(
-                        "Model loading errors"
-                    ):
+                        st.warning(
+                            "Some models could not be loaded."
+                        )
 
                         for error in model_errors:
 
                             st.write(
-                                f"• {error}"
+                                error
                             )
 
-            else:
+                    else:
 
-                if st.button(
-                    "🚀 Predict Construction Materials",
-                    type="primary",
-                    use_container_width=True
-                ):
-
-                    with st.spinner(
-                        "Running ArchMind V2.4.1..."
-                    ):
-
-                        predictions = predict_materials(
-                            features
+                        predictions = (
+                            predict_materials(
+                                feature_df
+                            )
                         )
 
-                    st.subheader(
-                        "📊 Material Prediction"
-                    )
-
-                    p1, p2, p3, p4 = st.columns(4)
-
-                    cement = predictions.get(
-                        "cement_bags"
-                    )
-
-                    steel = predictions.get(
-                        "steel_tonnes"
-                    )
-
-                    bricks = predictions.get(
-                        "brick_count"
-                    )
-
-                    aac = predictions.get(
-                        "aac_block_count"
-                    )
-
-                    if cement is not None:
-
-                        p1.metric(
-                            "Cement",
-                            f"{cement:,.0f} bags"
+                        st.subheader(
+                            "📊 Predicted Materials"
                         )
 
-                    if steel is not None:
+                        p1, p2 = st.columns(2)
 
-                        p2.metric(
-                            "Steel",
-                            f"{steel:,.2f} tonnes"
+                        with p1:
+
+                            cement = predictions[
+                                "cement_bags"
+                            ]
+
+                            steel = predictions[
+                                "steel_tonnes"
+                            ]
+
+                            st.metric(
+                                "Cement",
+                                f"{cement:,.0f} bags"
+                                if cement is not None
+                                else "Unavailable",
+                            )
+
+                            st.metric(
+                                "Steel",
+                                f"{steel:,.2f} tonnes"
+                                if steel is not None
+                                else "Unavailable",
+                            )
+
+                        with p2:
+
+                            bricks = predictions[
+                                "brick_count"
+                            ]
+
+                            aac = predictions[
+                                "aac_block_count"
+                            ]
+
+                            st.metric(
+                                "Bricks",
+                                f"{bricks:,.0f}"
+                                if bricks is not None
+                                else "Unavailable",
+                            )
+
+                            st.metric(
+                                "AAC Blocks",
+                                f"{aac:,.0f}"
+                                if aac is not None
+                                else "Unavailable",
+                            )
+
+                        st.info(
+                            "These outputs are ML predictions "
+                            "from the ArchMind V2.2 synthetic "
+                            "engineering-informed training dataset. "
+                            "They are intended for prototyping and "
+                            "should not replace professional "
+                            "structural/material estimation."
                         )
 
-                    if bricks is not None:
+        except Exception as e:
 
-                        p3.metric(
-                            "Bricks",
-                            f"{bricks:,.0f}"
-                        )
-
-                    if aac is not None:
-
-                        p4.metric(
-                            "AAC Blocks",
-                            f"{aac:,.0f}"
-                        )
-
-                    st.success(
-                        "✅ Material prediction completed."
-                    )
-
-                    st.caption(
-                        "Predictions are generated using "
-                        "custom-trained ArchMind ML models."
-                    )
-
-                    st.warning(
-                        """
-                        ⚠️ Prototype disclaimer:
-                        These predictions are based on a synthetic,
-                        engineering-informed dataset created for ML
-                        prototyping. They are not a substitute for
-                        structural design, quantity surveying, or
-                        professional engineering calculations.
-                        """
-                    )
+            st.error(
+                f"STL processing failed: {e}"
+            )
 
 
 # ============================================================
@@ -1780,18 +1852,13 @@ if page == "Material Prediction":
 elif page == "Geometry Analysis":
 
     st.header(
-        "🧠 Intelligent Geometry Analysis"
+        "📐 Geometry Intelligence"
     )
 
-    st.write(
-        "V2.4.1 analyzes the uploaded 3D geometry and "
-        "calculates building confidence before prediction."
-    )
-
-    if uploaded_file is None:
+    if uploaded_stl is None:
 
         st.info(
-            "Upload an STL file from the sidebar."
+            "Upload an STL model from the sidebar."
         )
 
     else:
@@ -1799,198 +1866,76 @@ elif page == "Geometry Analysis":
         try:
 
             mesh = load_stl_mesh(
-                uploaded_file
+                uploaded_stl
             )
 
-            geometry = analyze_mesh(
-                mesh
+            geometry = analyze_geometry(
+                mesh,
+                num_floors_input,
+                floor_height,
             )
 
-            # ------------------------------------------------
-            # Confidence
-            # ------------------------------------------------
+            show_building_classification(
+                geometry
+            )
+
+            st.divider()
+
+            show_floor_estimation(
+                geometry,
+                num_floors_input,
+                floor_height,
+            )
+
+            st.divider()
+
+            show_geometry_metrics(
+                geometry
+            )
+
+            st.divider()
 
             st.subheader(
-                "Building Confidence"
+                "🧠 Geometry Observations"
             )
 
-            confidence = int(
-                geometry[
-                    "building_confidence"
-                ]
-            )
-
-            st.progress(
-                confidence
-            )
-
-            st.write(
-                f"**{confidence}% — "
-                f"{geometry['classification']}**"
-            )
-
-            # ------------------------------------------------
-            # Metrics
-            # ------------------------------------------------
-
-            c1, c2, c3, c4 = st.columns(4)
-
-            c1.metric(
-                "Width",
-                f"{geometry['width_ft']:.1f} ft"
-            )
-
-            c2.metric(
-                "Depth",
-                f"{geometry['depth_ft']:.1f} ft"
-            )
-
-            c3.metric(
-                "Height",
-                f"{geometry['height_ft']:.1f} ft"
-            )
-
-            c4.metric(
-                "Footprint",
-                f"{geometry['footprint_area_sqft']:,.0f} sqft"
-            )
-
-            st.markdown("---")
-
-            # ------------------------------------------------
-            # Table
-            # ------------------------------------------------
-
-            rows = {
-
-                "Width (ft)":
-                    geometry["width_ft"],
-
-                "Depth (ft)":
-                    geometry["depth_ft"],
-
-                "Height (ft)":
-                    geometry["height_ft"],
-
-                "Footprint (sqft)":
-                    geometry["footprint_area_sqft"],
-
-                "Volume":
-                    geometry["volume"],
-
-                "Surface Area":
-                    geometry["surface_area"],
-
-                "Bounding Volume":
-                    geometry["bounding_volume"],
-
-                "Volume Fill Ratio":
-                    geometry["volume_fill_ratio"],
-
-                "Expected Height":
-                    geometry["expected_height"],
-
-                "Height Ratio":
-                    geometry["height_ratio"],
-
-                "Height Severity":
-                    geometry["height_severity"],
-
-                "Height / Footprint":
-                    geometry[
-                        "height_to_footprint_ratio"
-                    ],
-
-                "Surface / Volume":
-                    geometry[
-                        "surface_volume_ratio"
-                    ],
-
-                "Connected Components":
-                    geometry[
-                        "component_count"
-                    ],
-
-                "Vertices":
-                    geometry[
-                        "vertex_count"
-                    ],
-
-                "Faces":
-                    geometry[
-                        "face_count"
-                    ],
-
-                "Watertight":
-                    geometry[
-                        "is_watertight"
-                    ],
-
-                "Geometry Score":
-                    geometry[
-                        "geometry_score"
-                    ],
-
-                "Building Confidence":
-                    geometry[
-                        "building_confidence"
-                    ],
-
-                "Classification":
-                    geometry[
-                        "classification"
-                    ],
-
-                "Prediction Allowed":
-                    geometry[
-                        "prediction_allowed"
-                    ]
-            }
-
-            geometry_df = pd.DataFrame(
-                rows.items(),
-                columns=[
-                    "Property",
-                    "Value"
-                ]
-            )
-
-            st.dataframe(
-                geometry_df,
-                use_container_width=True,
-                hide_index=True
-            )
-
-            # ------------------------------------------------
-            # Final classification
-            # ------------------------------------------------
-
-            if (
-                geometry["classification"]
-                ==
-                "Likely Building"
-            ):
-
-                st.success(
-                    "✅ Geometry passes the current "
-                    "building plausibility checks."
-                )
-
-            elif (
-                geometry["classification"]
-                ==
-                "Uncertain Structure"
-            ):
+            if geometry[
+                "floor_mismatch"
+            ]:
 
                 st.warning(
-                    "⚠️ Geometry requires additional validation."
+                    f"Selected floor configuration differs "
+                    f"from geometry. Estimated floors: "
+                    f"**{geometry['estimated_floors']}**."
+                )
+
+            if geometry[
+                "watertight"
+            ]:
+
+                st.success(
+                    "✓ Mesh is watertight."
                 )
 
             else:
 
-                st.error(
-                    "🚫 Geometry is unlikely to represent "
-                    "a conventional building."
+                st.warning(
+                    "⚠ Mesh is not watertight."
+                )
+
+            if geometry[
+                "volume_fill_ratio"
+            ] < 0.15:
+
+                st.warning(
+                    "⚠ Geometry has a relatively low "
+                    "volume-fill ratio."
+                )
+
+            else:
+
+                st.success(
+                    "✓ Geometry has reasonable volume density."
                 )
 
         except Exception as e:
@@ -2007,18 +1952,18 @@ elif page == "Geometry Analysis":
 elif page == "Feature Preview":
 
     st.header(
-        "🔬 ML Feature Preview"
+        "🔎 ML Feature Preview"
     )
 
     st.write(
-        "Features generated before being passed to "
-        "the V2.2 material prediction models."
+        "These are the features currently supplied "
+        "to the V2.2 material prediction models."
     )
 
-    if uploaded_file is None:
+    if uploaded_stl is None:
 
         st.info(
-            "Upload an STL file to preview generated features."
+            "Upload an STL model to generate features."
         )
 
     else:
@@ -2026,41 +1971,42 @@ elif page == "Feature Preview":
         try:
 
             mesh = load_stl_mesh(
-                uploaded_file
+                uploaded_stl
             )
 
-            geometry = analyze_mesh(
-                mesh
+            geometry = analyze_geometry(
+                mesh,
+                num_floors_input,
+                floor_height,
             )
 
-            features = estimate_features(
-                geometry
+            confirmed_floors = st.session_state.get(
+                "confirmed_floors",
+                geometry["estimated_floors"],
             )
 
-            feature_df = pd.DataFrame(
-                {
-                    "Feature":
-                        list(
-                            features.keys()
-                        ),
-
-                    "Value":
-                        list(
-                            features.values()
-                        )
-                }
+            feature_df = build_prediction_features(
+                geometry,
+                confirmed_floors,
+                floor_height,
+                foundation_depth,
+                wall_thickness,
+                soil_condition,
+                masonry_type,
+                structural_intensity,
             )
 
             st.dataframe(
-                feature_df,
+                feature_df.T.rename(
+                    columns={0: "Value"}
+                ),
                 use_container_width=True,
-                hide_index=True
             )
 
         except Exception as e:
 
             st.error(
-                f"Feature extraction failed: {e}"
+                f"Feature generation failed: {e}"
             )
 
 
@@ -2071,127 +2017,78 @@ elif page == "Feature Preview":
 elif page == "About":
 
     st.header(
-        "🏗️ About ArchMind Pro"
+        "ℹ️ About ArchMind Pro"
     )
 
     st.markdown(
         """
-        ## ArchMind Pro V2.4.1
+## ArchMind Pro V2.5
 
-        ArchMind Pro is an AI-powered construction material
-        intelligence prototype.
+ArchMind Pro is an AI-powered construction
+material intelligence prototype.
 
-        ### Core Technologies
+### Current pipeline
 
-        - 🧊 3D STL geometry processing
-        - 🧠 Intelligent geometry validation
-        - 🤖 Custom-trained machine learning
-        - 📊 Construction material prediction
-        - ☁️ Streamlit deployment
-        - 📦 Hugging Face model hosting
+**2D Blueprint**
+→ Computer Vision
+→ Structural Footprint
+→ Procedural 3D Geometry
+→ Geometry Intelligence
+→ Building Classification
+→ Automatic Floor Estimation
+→ Custom ML Models
+→ Material Prediction
 
-        ### V2.4.1 Pipeline
+### V2.5 improvements
 
-        ```text
-        STL Model
-             ↓
-        Geometry Extraction
-             ↓
-        Building Plausibility Analysis
-             ↓
-        Height & Structural Validation
-             ↓
-        Confidence Scoring
-             ↓
-        Feature Engineering
-             ↓
-        Custom ML Models
-             ↓
-        Material Prediction
-        ```
+- Automatic floor estimation
+- Building plausibility classification
+- Floor configuration confirmation
+- Geometry validation
+- STL processing
+- Blueprint-to-3D MVP
+- Material prediction using custom-trained models
+- Hugging Face model deployment
 
-        ### Current ML Outputs
+### Important limitation
 
-        - Cement bags
-        - Steel tonnes
-        - Brick count
-        - AAC block count
+ArchMind Pro currently performs
+**geometry-based building plausibility checks**.
 
-        ### Safety Gate
+It does not claim to understand every
+architectural STL or blueprint automatically.
 
-        ArchMind does not blindly send every STL
-        to the material prediction model.
+The material models were trained on a
+**synthetic engineering-informed dataset**
+for ML prototyping and should not be treated
+as professional structural engineering output.
 
-        The V2.4.1 validation layer checks whether
-        the geometry is compatible with the selected
-        building configuration before prediction.
+### Technology
 
-        ### Important
+- Python
+- Streamlit
+- OpenCV
+- Trimesh
+- NumPy
+- Pandas
+- scikit-learn
+- XGBoost
+- Joblib
+- Hugging Face Hub
 
-        The current dataset is a synthetic,
-        engineering-informed dataset created for
-        ML prototyping.
+### Roadmap
 
-        The system is not structural-design software
-        and should not replace professional engineering,
-        quantity surveying, or construction planning.
-        """
+**V2.5**
+Blueprint → 3D + intelligent floor estimation
+
+**V3**
+Better structural feature extraction
+
+**V3.x**
+Algorithm benchmarking and model competition
+
+**Future**
+Safety monitoring, manpower planning,
+progress analysis and explainable AI.
+"""
     )
-
-    st.markdown("---")
-
-    st.subheader(
-        "🚀 Development Roadmap"
-    )
-
-    roadmap = pd.DataFrame(
-        {
-            "Version": [
-                "V2.1",
-                "V2.2",
-                "V2.3",
-                "V2.4",
-                "V2.4.1",
-                "V2.5",
-                "V3.0"
-            ],
-
-            "Capability": [
-                "Initial ML prototype",
-                "50K-row material intelligence dataset",
-                "STL geometry validation",
-                "Intelligent geometry extraction",
-                "Improved geometry confidence & safety gate",
-                "Blueprint → 3D reconstruction",
-                "Improved ML feature generation"
-            ],
-
-            "Status": [
-                "Completed",
-                "Completed",
-                "Completed",
-                "Completed",
-                "Current",
-                "Planned",
-                "Planned"
-            ]
-        }
-    )
-
-    st.dataframe(
-        roadmap,
-        use_container_width=True,
-        hide_index=True
-    )
-
-
-# ============================================================
-# FOOTER
-# ============================================================
-
-st.markdown("---")
-
-st.caption(
-    "ArchMind Pro V2.4.1 • "
-    "AI-powered construction material intelligence"
-)
