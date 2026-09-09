@@ -19,7 +19,7 @@ warnings.filterwarnings("ignore")
 # AI-POWERED CONSTRUCTION MATERIAL INTELLIGENCE
 # ============================================================
 
-APP_VERSION = "V2.7.0"
+APP_VERSION = "V2.7.2"
 
 HF_REPO_ID = "AloneMrY/archmind-pro-v2-2-models"
 
@@ -1634,59 +1634,53 @@ def crop_blueprint_region(image_array, bounds, padding=8):
 
 
 
-def detect_wall_segments(plan_gray, min_length_ratio=0.045):
-    """V2.7: detect candidate horizontal/vertical wall centerlines.
+def detect_wall_segments(plan_gray, min_length_ratio=0.035, max_segments=45):
+    """V2.7.2 structural wall candidate detector.
 
-    This is deliberately a geometry-first detector. It does not claim
-    to semantically identify rooms, doors, furniture, or labels yet.
-    Long collinear architectural strokes are merged into wall segments.
+    Hough lines are treated as raw geometric evidence, not walls. The
+    detector scores candidates using length, continuity, intersections and
+    proximity to a parallel line. This suppresses many furniture/detail
+    strokes before they reach the 3D reconstruction stage.
     """
     gray = np.asarray(plan_gray)
+    if gray.ndim == 3:
+        gray = cv2.cvtColor(gray, cv2.COLOR_RGB2GRAY)
     h, w = gray.shape[:2]
 
     if h < 20 or w < 20:
         return [], np.zeros_like(gray)
 
     edges = cv2.Canny(gray, 50, 150)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=1)
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, close_kernel, iterations=1)
 
-    min_len = max(25, int(min(h, w) * min_length_ratio))
+    min_len = max(28, int(min(h, w) * min_length_ratio))
     raw = cv2.HoughLinesP(
         edges,
         1,
         np.pi / 180,
-        threshold=max(25, int(min(h, w) * 0.035)),
+        threshold=max(22, int(min(h, w) * 0.025)),
         minLineLength=min_len,
-        maxLineGap=max(8, int(min(h, w) * 0.015)),
+        maxLineGap=max(10, int(min(h, w) * 0.02)),
     )
 
     if raw is None:
         return [], edges
 
-    # OpenCV may return HoughLinesP output as either (N, 1, 4) or (N, 4),
-    # depending on the OpenCV build/input path. Normalize it before iterating.
     raw = np.asarray(raw)
     if raw.size == 0:
         return [], edges
-    if raw.ndim == 3 and raw.shape[-1] == 4:
+    try:
         raw_lines = raw.reshape(-1, 4)
-    elif raw.ndim == 2 and raw.shape[-1] == 4:
-        raw_lines = raw.reshape(-1, 4)
-    else:
-        # Defensive fallback for unexpected OpenCV output.
-        try:
-            raw_lines = raw.reshape(-1, 4)
-        except ValueError:
-            return [], edges
+    except ValueError:
+        return [], edges
 
     horizontal = []
     vertical = []
 
     for line in raw_lines:
         x1, y1, x2, y2 = [int(v) for v in line]
-        dx = x2 - x1
-        dy = y2 - y1
+        dx, dy = x2 - x1, y2 - y1
         length = math.hypot(dx, dy)
         if length < min_len:
             continue
@@ -1695,23 +1689,17 @@ def detect_wall_segments(plan_gray, min_length_ratio=0.045):
         if angle > 90:
             angle = 180 - angle
 
-        # Keep near-axis-aligned architectural lines.
-        if angle <= 7:
-            y = (y1 + y2) / 2.0
-            horizontal.append((y, min(x1, x2), max(x1, x2)))
-        elif abs(angle - 90) <= 7:
-            x = (x1 + x2) / 2.0
-            vertical.append((x, min(y1, y2), max(y1, y2)))
+        if angle <= 6:
+            horizontal.append(((y1 + y2) / 2.0, min(x1, x2), max(x1, x2)))
+        elif abs(angle - 90) <= 6:
+            vertical.append(((x1 + x2) / 2.0, min(y1, y2), max(y1, y2)))
 
-    def merge_segments(items, axis_limit, coord_tol=10, gap_tol=18):
+    def merge_segments(items, axis_limit, coord_tol=7, gap_tol=14):
         if not items:
             return []
-
-        # Cluster parallel strokes by their perpendicular coordinate.
         items = sorted(items, key=lambda v: (v[0], v[1]))
         clusters = []
         current = [items[0]]
-
         for item in items[1:]:
             if abs(item[0] - np.mean([v[0] for v in current])) <= coord_tol:
                 current.append(item)
@@ -1726,54 +1714,121 @@ def detect_wall_segments(plan_gray, min_length_ratio=0.045):
             intervals = sorted((v[1], v[2]) for v in cluster)
             merged = []
             start, end = intervals[0]
-
-            for a, b in intervals[1:]:
-                if a <= end + gap_tol:
-                    end = max(end, b)
+            for aa, bb in intervals[1:]:
+                if aa <= end + gap_tol:
+                    end = max(end, bb)
                 else:
-                    if end - start >= axis_limit * 0.035:
+                    if end - start >= max(30, axis_limit * 0.025):
                         merged.append((start, end))
-                    start, end = a, b
-
-            if end - start >= axis_limit * 0.035:
+                    start, end = aa, bb
+            if end - start >= max(30, axis_limit * 0.025):
                 merged.append((start, end))
-
             for start, end in merged:
-                output.append((coord, start, end))
-
+                output.append((coord, float(start), float(end)))
         return output
 
     h_segments = merge_segments(horizontal, w)
     v_segments = merge_segments(vertical, h)
 
-    # Convert to a common segment representation and remove very short noise.
-    segments = []
+    candidates = []
     for y, x1, x2 in h_segments:
-        length = float(x2 - x1)
+        length = x2 - x1
         if length >= min_len:
-            segments.append({
+            candidates.append({
                 "orientation": "horizontal",
-                "x1": float(x1), "y1": float(y),
-                "x2": float(x2), "y2": float(y),
-                "length_px": length,
+                "x1": x1, "y1": y,
+                "x2": x2, "y2": y,
+                "length_px": float(length),
             })
-
     for x, y1, y2 in v_segments:
-        length = float(y2 - y1)
+        length = y2 - y1
         if length >= min_len:
-            segments.append({
+            candidates.append({
                 "orientation": "vertical",
-                "x1": float(x), "y1": float(y1),
-                "x2": float(x), "y2": float(y2),
-                "length_px": length,
+                "x1": x, "y1": y1,
+                "x2": x, "y2": y2,
+                "length_px": float(length),
             })
 
-    # Prefer the longest candidates if a blueprint is unusually dense.
-    segments.sort(key=lambda s: s["length_px"], reverse=True)
-    segments = segments[:100]
+    if not candidates:
+        return [], edges
+
+    # Geometry-only structural scoring.
+    def overlap_ratio(a1, a2, b1, b2):
+        inter = max(0.0, min(a2, b2) - max(a1, b1))
+        denom = max(1.0, min(a2 - a1, b2 - b1))
+        return inter / denom
+
+    for i, seg in enumerate(candidates):
+        length = seg["length_px"]
+        length_score = min(1.0, length / max(1.0, min(h, w) * 0.45))
+        parallel_support = 0.0
+        intersection_support = 0.0
+
+        if seg["orientation"] == "horizontal":
+            for j, other in enumerate(candidates):
+                if i == j or other["orientation"] != "horizontal":
+                    continue
+                y_gap = abs(seg["y1"] - other["y1"])
+                if 3 <= y_gap <= 18:
+                    ov = overlap_ratio(seg["x1"], seg["x2"], other["x1"], other["x2"])
+                    parallel_support = max(parallel_support, ov)
+            for other in candidates:
+                if other["orientation"] == "vertical":
+                    if other["x1"] >= seg["x1"] - 2 and other["x1"] <= seg["x2"] + 2:
+                        if other["y1"] <= seg["y1"] <= other["y2"]:
+                            intersection_support += 1
+        else:
+            for j, other in enumerate(candidates):
+                if i == j or other["orientation"] != "vertical":
+                    continue
+                x_gap = abs(seg["x1"] - other["x1"])
+                if 3 <= x_gap <= 18:
+                    ov = overlap_ratio(seg["y1"], seg["y2"], other["y1"], other["y2"])
+                    parallel_support = max(parallel_support, ov)
+            for other in candidates:
+                if other["orientation"] == "horizontal":
+                    if other["y1"] >= seg["y1"] - 2 and other["y1"] <= seg["y2"] + 2:
+                        if other["x1"] <= seg["x1"] <= other["x2"]:
+                            intersection_support += 1
+
+        # Longer + connected + paired lines are stronger structural evidence.
+        seg["structural_score"] = (
+            0.58 * length_score
+            + 0.27 * min(1.0, parallel_support)
+            + 0.15 * min(1.0, intersection_support / 4.0)
+        )
+        seg["paired_support"] = float(parallel_support)
+
+    # Keep strong candidates, but retain enough lines for complex plans.
+    candidates.sort(key=lambda s: (s["structural_score"], s["length_px"]), reverse=True)
+    strong = [s for s in candidates if s["structural_score"] >= 0.18]
+    if len(strong) < 12:
+        strong = candidates[:min(24, len(candidates))]
+    else:
+        strong = strong[:max_segments]
+
+    # Remove near-duplicate lines that survive scoring.
+    filtered = []
+    for seg in strong:
+        duplicate = False
+        for kept in filtered:
+            if seg["orientation"] != kept["orientation"]:
+                continue
+            if seg["orientation"] == "horizontal":
+                coord_gap = abs(seg["y1"] - kept["y1"])
+                ov = overlap_ratio(seg["x1"], seg["x2"], kept["x1"], kept["x2"])
+            else:
+                coord_gap = abs(seg["x1"] - kept["x1"])
+                ov = overlap_ratio(seg["y1"], seg["y2"], kept["y1"], kept["y2"])
+            if coord_gap <= 5 and ov >= 0.75:
+                duplicate = True
+                break
+        if not duplicate:
+            filtered.append(seg)
 
     overlay = np.zeros_like(gray)
-    for seg in segments:
+    for seg in filtered:
         cv2.line(
             overlay,
             (int(seg["x1"]), int(seg["y1"])),
@@ -1782,8 +1837,7 @@ def detect_wall_segments(plan_gray, min_length_ratio=0.045):
             2,
         )
 
-    return segments, overlay
-
+    return filtered, overlay
 
 def create_wall_reconstruction_mesh(
     segments,
@@ -2471,7 +2525,7 @@ if page == "Blueprint → 3D":
 
             if wall_segments:
                 st.success(
-                    f"🧱 V2.7 detected {len(wall_segments)} candidate wall segments. "
+                    f"🧱 V2.7.2 detected {len(wall_segments)} filtered structural wall candidates. "
                     "These are geometric candidates, not yet semantic room labels."
                 )
             else:
