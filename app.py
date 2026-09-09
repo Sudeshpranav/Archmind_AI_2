@@ -1664,10 +1664,26 @@ def detect_wall_segments(plan_gray, min_length_ratio=0.045):
     if raw is None:
         return [], edges
 
+    # OpenCV may return HoughLinesP output as either (N, 1, 4) or (N, 4),
+    # depending on the OpenCV build/input path. Normalize it before iterating.
+    raw = np.asarray(raw)
+    if raw.size == 0:
+        return [], edges
+    if raw.ndim == 3 and raw.shape[-1] == 4:
+        raw_lines = raw.reshape(-1, 4)
+    elif raw.ndim == 2 and raw.shape[-1] == 4:
+        raw_lines = raw.reshape(-1, 4)
+    else:
+        # Defensive fallback for unexpected OpenCV output.
+        try:
+            raw_lines = raw.reshape(-1, 4)
+        except ValueError:
+            return [], edges
+
     horizontal = []
     vertical = []
 
-    for line in raw[:, 0, :]:
+    for line in raw_lines:
         x1, y1, x2, y2 = [int(v) for v in line]
         dx = x2 - x1
         dy = y2 - y1
