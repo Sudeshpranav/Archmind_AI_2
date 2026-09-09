@@ -19,7 +19,7 @@ warnings.filterwarnings("ignore")
 # AI-POWERED CONSTRUCTION MATERIAL INTELLIGENCE
 # ============================================================
 
-APP_VERSION = "V2.6.0"
+APP_VERSION = "V2.6.1"
 
 HF_REPO_ID = "AloneMrY/archmind-pro-v2-2-models"
 
@@ -2074,18 +2074,40 @@ if page == "Blueprint → 3D":
         key="blueprint",
     )
 
-    known_width = st.number_input(
-        "Known Building Width (ft)",
+    st.subheader("📏 Scale Calibration")
+
+    calibration_mode = st.radio(
+        "What real-world dimension do you know?",
+        [
+            "Overall Building Width",
+            "Overall Building Depth",
+            "No Overall Dimension Available",
+        ],
+        horizontal=True,
+        help=(
+            "Use the outside-to-outside dimension of the complete floor plan. "
+            "Do not enter a room dimension such as 10 ft or 11 ft as the overall width."
+        ),
+    )
+
+    reference_dimension = st.number_input(
+        "Known Overall Dimension (ft)",
         min_value=5.0,
         max_value=500.0,
         value=30.0,
         step=1.0,
+        disabled=(calibration_mode == "No Overall Dimension Available"),
         help=(
-            "Use a reliable overall building width if the drawing "
-            "does not provide a machine-readable overall dimension. "
-            "V2.6 will use this only for scale estimation."
+            "Enter a dimension measured across the entire building footprint. "
+            "For example, if the whole plan is 35 ft wide, enter 35—not the width of one room."
         ),
     )
+
+    if calibration_mode != "No Overall Dimension Available":
+        st.caption(
+            "💡 Important: a room label like 11 ft × 15 ft is not the overall building width. "
+            "Use the full exterior dimension of the floor plan."
+        )
 
     if blueprint:
 
@@ -2185,44 +2207,70 @@ if page == "Blueprint → 3D":
                     use_container_width=True,
                 )
 
-            st.subheader("3️⃣ Current Scale Estimate")
+            st.subheader("3️⃣ Calibrated Scale Estimate")
 
-            width_px = bounds["width_px"]
-            height_px = bounds["height_px"]
+            width_px = float(bounds["width_px"])
+            height_px = float(bounds["height_px"])
+            aspect_ratio = safe_div(height_px, width_px)
 
-            scale = safe_div(
-                known_width,
-                width_px,
-            )
+            if calibration_mode == "Overall Building Width":
+                calibrated_width = float(reference_dimension)
+                calibrated_depth = height_px * safe_div(calibrated_width, width_px)
+                scale_basis = "overall width"
 
-            detected_depth = (
-                height_px * scale
-            )
+            elif calibration_mode == "Overall Building Depth":
+                calibrated_depth = float(reference_dimension)
+                calibrated_width = width_px * safe_div(calibrated_depth, height_px)
+                scale_basis = "overall depth"
 
-            c1, c2, c3 = st.columns(3)
+            else:
+                calibrated_width = width_px
+                calibrated_depth = height_px
+                scale_basis = "pixel geometry (no real-world scale)"
+
+            calibrated_footprint = calibrated_width * calibrated_depth
+
+            c1, c2, c3, c4 = st.columns(4)
 
             with c1:
                 st.metric(
-                    "Reference Width",
-                    f"{known_width:.1f} ft",
+                    "Calibrated Width",
+                    f"{calibrated_width:.1f} ft" if calibration_mode != "No Overall Dimension Available" else "Unscaled",
                 )
 
             with c2:
                 st.metric(
-                    "Estimated Depth",
-                    f"{detected_depth:.1f} ft",
+                    "Calibrated Depth",
+                    f"{calibrated_depth:.1f} ft" if calibration_mode != "No Overall Dimension Available" else "Unscaled",
                 )
 
             with c3:
                 st.metric(
+                    "Plan Aspect Ratio",
+                    f"1 : {aspect_ratio:.2f}",
+                )
+
+            with c4:
+                st.metric(
                     "Estimated Footprint",
-                    f"{known_width * detected_depth:,.0f} sqft",
+                    f"{calibrated_footprint:,.0f} sqft" if calibration_mode != "No Overall Dimension Available" else "Unavailable",
+                )
+
+            if calibration_mode == "No Overall Dimension Available":
+                st.warning(
+                    "⚠️ No real-world dimension was supplied. ArchMind can analyze the "
+                    "pixel geometry, but it will not claim a real-world footprint or "
+                    "use this unscaled geometry for material estimation."
+                )
+            else:
+                st.success(
+                    f"✅ Scale calibrated using the {scale_basis}. "
+                    "The reference dimension is applied to the complete detected plan boundary."
                 )
 
             st.caption(
-                "⚠️ This scale is based on the user-provided reference "
-                "width. Automatic dimension/OCR scale extraction is a "
-                "later V2.6/V2.7 stage."
+                "Automatic dimension/OCR extraction is still a future reconstruction stage. "
+                "For now, use an actual overall exterior dimension when available."
             )
 
             st.subheader("4️⃣ Generate Procedural 3D Baseline")
@@ -2232,9 +2280,16 @@ if page == "Blueprint → 3D":
                 type="primary",
             ):
 
+                if calibration_mode == "No Overall Dimension Available":
+                    st.error(
+                        "❌ Please provide an overall building width or depth before "
+                        "generating a real-world 3D baseline."
+                    )
+                    st.stop()
+
                 generated_mesh = create_building_mesh(
-                    known_width,
-                    detected_depth,
+                    calibrated_width,
+                    calibrated_depth,
                     num_floors_input,
                     floor_height,
                     wall_thickness,
