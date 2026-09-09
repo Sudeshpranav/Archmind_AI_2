@@ -19,7 +19,7 @@ warnings.filterwarnings("ignore")
 # AI-POWERED CONSTRUCTION MATERIAL INTELLIGENCE
 # ============================================================
 
-APP_VERSION = "V2.7.2"
+APP_VERSION = "V2.7.3"
 
 HF_REPO_ID = "AloneMrY/archmind-pro-v2-2-models"
 
@@ -1839,36 +1839,86 @@ def detect_wall_segments(plan_gray, min_length_ratio=0.035, max_segments=45):
 
     return filtered, overlay
 
+def build_architectural_wall_mask(gray, segments, wall_px=5):
+    """V2.7.3: turn filtered wall-line evidence into a connected wall mask.
+
+    The mask is deliberately derived from already-filtered geometric candidates.
+    It is an intermediate CV representation, not semantic room recognition.
+    """
+    gray = np.asarray(gray)
+    if gray.ndim == 3:
+        gray = cv2.cvtColor(gray, cv2.COLOR_RGB2GRAY)
+
+    h, w = gray.shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+
+    if not segments:
+        return mask
+
+    thickness = max(2, int(wall_px))
+    for seg in segments:
+        cv2.line(
+            mask,
+            (int(seg["x1"]), int(seg["y1"])),
+            (int(seg["x2"]), int(seg["y2"])),
+            255,
+            thickness,
+        )
+
+    # Bridge small gaps at wall intersections while avoiding aggressive filling.
+    close_size = max(3, min(11, int(min(h, w) * 0.008) | 1))
+    close_kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT, (close_size, close_size)
+    )
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel, iterations=1)
+
+    # Remove tiny isolated components that are unlikely to be structural walls.
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+    cleaned = np.zeros_like(mask)
+    min_area = max(80, int(h * w * 0.00012))
+    for label in range(1, num_labels):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        width = int(stats[label, cv2.CC_STAT_WIDTH])
+        height = int(stats[label, cv2.CC_STAT_HEIGHT])
+        if area >= min_area and (width >= 20 or height >= 20):
+            cleaned[labels == label] = 255
+
+    return cleaned
+
+
 def create_wall_reconstruction_mesh(
     segments,
     plan_width_ft,
     plan_depth_ft,
-    num_floors,
+    floor_number,
     floor_height,
     wall_thickness_in,
 ):
-    """Create a procedural 3D wall network from V2.7 line candidates."""
+    """Create a 3D reconstruction for ONE uploaded floor plan.
+
+    V2.7.3 intentionally does not duplicate one blueprint across all floors.
+    Each uploaded blueprint represents one floor and is positioned at its
+    declared floor number. Multi-floor stacking will be implemented later
+    when multiple floor plans can be uploaded and aligned independently.
+    """
     if not segments:
         return None
 
     wall_t = max(0.15, wall_thickness_in / 12.0)
-    total_height = max(1.0, num_floors * floor_height)
-
-    # Pixel-to-foot mapping for the detected/cropped plan region.
-    # x maps left→right, y maps top→bottom.
+    floor_idx = max(0, int(floor_number) - 1)
+    z_base = floor_idx * floor_height
     parts = []
-    used = 0
 
     for seg in segments:
-        x1 = np.clip(seg["x1"], 0, max(1, seg.get("plan_width_px", 1)))
-        x2 = np.clip(seg["x2"], 0, max(1, seg.get("plan_width_px", 1)))
-        y1 = np.clip(seg["y1"], 0, max(1, seg.get("plan_height_px", 1)))
-        y2 = np.clip(seg["y2"], 0, max(1, seg.get("plan_height_px", 1)))
-
         pw = float(seg.get("plan_width_px", 1))
         ph = float(seg.get("plan_height_px", 1))
         if pw <= 1 or ph <= 1:
             continue
+
+        x1 = np.clip(seg["x1"], 0, pw)
+        x2 = np.clip(seg["x2"], 0, pw)
+        y1 = np.clip(seg["y1"], 0, ph)
+        y2 = np.clip(seg["y2"], 0, ph)
 
         fx1 = (x1 / pw - 0.5) * plan_width_ft
         fx2 = (x2 / pw - 0.5) * plan_width_ft
@@ -1879,49 +1929,30 @@ def create_wall_reconstruction_mesh(
             length = abs(fx2 - fx1)
             if length < 1.5:
                 continue
-            center = [(fx1 + fx2) / 2.0, (fy1 + fy2) / 2.0, 0]
-            wall = trimesh.creation.box(
-                extents=[length, wall_t, floor_height]
-            )
+            center = [(fx1 + fx2) / 2.0, (fy1 + fy2) / 2.0, z_base + floor_height / 2.0]
+            wall = trimesh.creation.box(extents=[length, wall_t, floor_height])
         else:
             length = abs(fy2 - fy1)
             if length < 1.5:
                 continue
-            center = [(fx1 + fx2) / 2.0, (fy1 + fy2) / 2.0, 0]
-            wall = trimesh.creation.box(
-                extents=[wall_t, length, floor_height]
-            )
+            center = [(fx1 + fx2) / 2.0, (fy1 + fy2) / 2.0, z_base + floor_height / 2.0]
+            wall = trimesh.creation.box(extents=[wall_t, length, floor_height])
 
-        # Repeat the detected floor-plan walls on each configured floor.
-        for floor_idx in range(int(num_floors)):
-            part = wall.copy()
-            part.apply_translation(
-                [center[0], center[1], floor_idx * floor_height + floor_height / 2.0]
-            )
-            parts.append(part)
-            used += 1
-
-        if used >= 250:
+        wall.apply_translation(center)
+        parts.append(wall)
+        if len(parts) >= 180:
             break
 
     if not parts:
         return None
 
-    # Add floor slabs so the reconstructed wall network has a usable building shell.
     slab_t = 0.5
-    for floor_idx in range(int(num_floors)):
-        slab = trimesh.creation.box(
-            extents=[plan_width_ft, plan_depth_ft, slab_t]
-        )
-        slab.apply_translation(
-            [0, 0, floor_idx * floor_height]
-        )
-        parts.append(slab)
+    slab = trimesh.creation.box(extents=[plan_width_ft, plan_depth_ft, slab_t])
+    slab.apply_translation([0, 0, z_base])
+    parts.append(slab)
 
-    roof = trimesh.creation.box(
-        extents=[plan_width_ft, plan_depth_ft, slab_t]
-    )
-    roof.apply_translation([0, 0, total_height])
+    roof = trimesh.creation.box(extents=[plan_width_ft, plan_depth_ft, slab_t])
+    roof.apply_translation([0, 0, z_base + floor_height])
     parts.append(roof)
 
     return trimesh.util.concatenate(parts)
@@ -2367,6 +2398,25 @@ if page == "Blueprint → 3D":
         key="blueprint",
     )
 
+    st.subheader("🏢 Floor Configuration")
+
+    floor_number_input = st.number_input(
+        "Which floor does this blueprint represent?",
+        min_value=1,
+        max_value=100,
+        value=1,
+        step=1,
+        help=(
+            "Each uploaded blueprint represents ONE floor. Enter its floor number; "
+            "ArchMind will not duplicate this blueprint across other floors."
+        ),
+    )
+
+    st.info(
+        "This upload is treated as a single floor plan. Multiple floor uploads "
+        "will be aligned and stacked in a later multi-floor reconstruction stage."
+    )
+
     st.subheader("📏 Scale Calibration")
 
     calibration_mode = st.radio(
@@ -2448,6 +2498,12 @@ if page == "Blueprint → 3D":
                 cropped_gray
             )
 
+            wall_mask = build_architectural_wall_mask(
+                cropped_gray,
+                wall_segments,
+                wall_px=5,
+            )
+
             for segment in wall_segments:
                 segment["plan_width_px"] = cropped_gray.shape[1]
                 segment["plan_height_px"] = cropped_gray.shape[0]
@@ -2484,7 +2540,7 @@ if page == "Blueprint → 3D":
 
             st.subheader("2️⃣ Computer Vision Diagnostics")
 
-            d1, d2, d3, d4 = st.columns(4)
+            d1, d2, d3, d4, d5 = st.columns(5)
 
             with d1:
                 st.image(
@@ -2516,16 +2572,26 @@ if page == "Blueprint → 3D":
             with d4:
                 st.image(
                     cv2.cvtColor(
+                        wall_mask,
+                        cv2.COLOR_GRAY2RGB,
+                    ),
+                    caption="V2.7.3 Architectural Wall Mask",
+                    use_container_width=True,
+                )
+
+            with d5:
+                st.image(
+                    cv2.cvtColor(
                         wall_overlay,
                         cv2.COLOR_GRAY2RGB,
                     ),
-                    caption=f"V2.7 Wall Candidates ({len(wall_segments)})",
+                    caption=f"Filtered Wall Network ({len(wall_segments)})",
                     use_container_width=True,
                 )
 
             if wall_segments:
                 st.success(
-                    f"🧱 V2.7.2 detected {len(wall_segments)} filtered structural wall candidates. "
+                    f"🧱 V2.7.3 retained {len(wall_segments)} filtered structural wall candidates and built an architectural wall mask. "
                     "These are geometric candidates, not yet semantic room labels."
                 )
             else:
@@ -2603,8 +2669,8 @@ if page == "Blueprint → 3D":
             st.subheader("4️⃣ V2.7 Wall-Network 3D Reconstruction")
 
             st.caption(
-                "V2.7 converts detected horizontal/vertical architectural line candidates "
-                "into wall meshes. This is the first step beyond the simple rectangular baseline."
+                "V2.7.3 converts filtered wall evidence into a wall mask and then into 3D wall meshes. "
+                "This upload is reconstructed as one floor only; it is not duplicated across the building."
             )
 
             if st.button(
@@ -2624,7 +2690,7 @@ if page == "Blueprint → 3D":
                     reconstructed_segments,
                     calibrated_width,
                     calibrated_depth,
-                    num_floors_input,
+                    floor_number_input,
                     floor_height,
                     wall_thickness,
                 )
@@ -2637,8 +2703,8 @@ if page == "Blueprint → 3D":
                 else:
                     st.session_state["generated_mesh"] = generated_mesh
                     st.success(
-                        f"✅ V2.7 wall-network geometry generated from {len(reconstructed_segments)} "
-                        "candidate segments."
+                        f"✅ V2.7.3 single-floor wall-network geometry generated from {len(reconstructed_segments)} "
+                        f"candidate segments for Floor {int(floor_number_input)}."
                     )
 
             if "generated_mesh" in st.session_state:
