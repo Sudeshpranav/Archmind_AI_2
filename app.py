@@ -19,7 +19,7 @@ warnings.filterwarnings("ignore")
 # AI-POWERED CONSTRUCTION MATERIAL INTELLIGENCE
 # ============================================================
 
-APP_VERSION = "V2.7.3"
+APP_VERSION = "V2.7.4"
 
 HF_REPO_ID = "AloneMrY/archmind-pro-v2-2-models"
 
@@ -1839,52 +1839,220 @@ def detect_wall_segments(plan_gray, min_length_ratio=0.035, max_segments=45):
 
     return filtered, overlay
 
-def build_architectural_wall_mask(gray, segments, wall_px=5):
-    """V2.7.3: turn filtered wall-line evidence into a connected wall mask.
+def reconstruct_wall_network(gray, segments):
+    """V2.7.4: convert line candidates into a cleaner architectural wall graph.
 
-    The mask is deliberately derived from already-filtered geometric candidates.
-    It is an intermediate CV representation, not semantic room recognition.
+    The previous stage selected Hough evidence. This stage deliberately works
+    on that evidence instead of re-running Hough, and applies:
+      1. orientation normalization
+      2. close parallel-line consolidation
+      3. interval merging
+      4. endpoint extension to nearby perpendicular walls
+      5. removal of short isolated fragments
+      6. connected-component filtering on the resulting network
+
+    The output is still geometric wall evidence, not semantic room recognition.
     """
     gray = np.asarray(gray)
     if gray.ndim == 3:
         gray = cv2.cvtColor(gray, cv2.COLOR_RGB2GRAY)
+    h, w = gray.shape[:2]
+    if not segments:
+        return [], np.zeros_like(gray), np.zeros_like(gray)
 
+    raw = []
+    for seg in segments:
+        try:
+            x1, y1 = float(seg["x1"]), float(seg["y1"])
+            x2, y2 = float(seg["x2"]), float(seg["y2"])
+        except Exception:
+            continue
+        if seg.get("orientation") == "horizontal":
+            y = (y1 + y2) / 2.0
+            a, b = sorted((x1, x2))
+            if b - a >= max(20, w * 0.025):
+                raw.append({"orientation": "horizontal", "coord": y, "a": a, "b": b})
+        else:
+            x = (x1 + x2) / 2.0
+            a, b = sorted((y1, y2))
+            if b - a >= max(20, h * 0.025):
+                raw.append({"orientation": "vertical", "coord": x, "a": a, "b": b})
+
+    if not raw:
+        return [], np.zeros_like(gray), np.zeros_like(gray)
+
+    # Collapse very close parallel lines. If two detected lines overlap heavily,
+    # they are more likely the two edges of the same wall than two separate walls.
+    def consolidate_parallel(items, coord_tol=11, overlap_threshold=0.45):
+        if not items:
+            return []
+        items = sorted(items, key=lambda q: (q["coord"], q["a"]))
+        groups = []
+        for item in items:
+            placed = False
+            for group in reversed(groups[-3:]):
+                mean_coord = float(np.mean([g["coord"] for g in group]))
+                if abs(item["coord"] - mean_coord) <= coord_tol:
+                    group.append(item)
+                    placed = True
+                    break
+            if not placed:
+                groups.append([item])
+
+        out = []
+        for group in groups:
+            # Split a coordinate cluster when intervals are clearly disjoint.
+            intervals = sorted((g["a"], g["b"], g["coord"]) for g in group)
+            merged_intervals = []
+            for aa, bb, cc in intervals:
+                if not merged_intervals:
+                    merged_intervals.append([aa, bb, cc, 1])
+                    continue
+                prev = merged_intervals[-1]
+                overlap = max(0.0, min(prev[1], bb) - max(prev[0], aa))
+                denom = max(1.0, min(prev[1] - prev[0], bb - aa))
+                if overlap / denom >= overlap_threshold or aa <= prev[1] + 16:
+                    prev[0] = min(prev[0], aa)
+                    prev[1] = max(prev[1], bb)
+                    prev[2] = (prev[2] * prev[3] + cc) / (prev[3] + 1)
+                    prev[3] += 1
+                else:
+                    merged_intervals.append([aa, bb, cc, 1])
+            for aa, bb, cc, count in merged_intervals:
+                out.append({"coord": cc, "a": aa, "b": bb, "support": count})
+        return out
+
+    hs = consolidate_parallel([r for r in raw if r["orientation"] == "horizontal"])
+    vs = consolidate_parallel([r for r in raw if r["orientation"] == "vertical"])
+
+    # Merge intervals that are on the same structural line.
+    def merge_axis(items, coord_tol=9, gap_tol=22):
+        if not items:
+            return []
+        items = sorted(items, key=lambda q: (q["coord"], q["a"]))
+        clusters = []
+        for item in items:
+            if not clusters or abs(item["coord"] - np.mean([x["coord"] for x in clusters[-1]])) > coord_tol:
+                clusters.append([item])
+            else:
+                clusters[-1].append(item)
+        out = []
+        for cluster in clusters:
+            coord = float(np.median([x["coord"] for x in cluster]))
+            ints = sorted((x["a"], x["b"], x.get("support", 1)) for x in cluster)
+            cur_a, cur_b, cur_support = ints[0]
+            for aa, bb, support in ints[1:]:
+                if aa <= cur_b + gap_tol:
+                    cur_b = max(cur_b, bb)
+                    cur_support += support
+                else:
+                    out.append((coord, cur_a, cur_b, cur_support))
+                    cur_a, cur_b, cur_support = aa, bb, support
+            out.append((coord, cur_a, cur_b, cur_support))
+        return out
+
+    h_lines = merge_axis(hs)
+    v_lines = merge_axis(vs)
+
+    # Extend endpoints when a perpendicular structural line reaches the vicinity.
+    refined = []
+    extension = max(8.0, min(w, h) * 0.018)
+    min_final = max(28.0, min(w, h) * 0.045)
+
+    for y, x1, x2, support in h_lines:
+        left = x1
+        right = x2
+        for x, y1, y2, _ in v_lines:
+            if y1 - extension <= y <= y2 + extension:
+                if abs(x - left) <= extension:
+                    left = min(left, x)
+                if abs(x - right) <= extension:
+                    right = max(right, x)
+        if right - left >= min_final:
+            refined.append({
+                "orientation": "horizontal", "x1": left, "y1": y,
+                "x2": right, "y2": y, "support": int(support),
+            })
+
+    for x, y1, y2, support in v_lines:
+        top = y1
+        bottom = y2
+        for y, x1, x2, _ in h_lines:
+            if x1 - extension <= x <= x2 + extension:
+                if abs(y - top) <= extension:
+                    top = min(top, y)
+                if abs(y - bottom) <= extension:
+                    bottom = max(bottom, y)
+        if bottom - top >= min_final:
+            refined.append({
+                "orientation": "vertical", "x1": x, "y1": top,
+                "x2": x, "y2": bottom, "support": int(support),
+            })
+
+    # Remove near-duplicates after extension.
+    final = []
+    for seg in sorted(refined, key=lambda q: ((q.get("support", 1)),
+                                                math.hypot(q["x2"]-q["x1"], q["y2"]-q["y1"])), reverse=True):
+        duplicate = False
+        for keep in final:
+            if seg["orientation"] != keep["orientation"]:
+                continue
+            if seg["orientation"] == "horizontal":
+                if abs(seg["y1"] - keep["y1"]) <= 9:
+                    ov = max(0.0, min(seg["x2"], keep["x2"]) - max(seg["x1"], keep["x1"]))
+                    denom = max(1.0, min(seg["x2"]-seg["x1"], keep["x2"]-keep["x1"]))
+                    if ov / denom >= 0.70:
+                        duplicate = True
+                        break
+            else:
+                if abs(seg["x1"] - keep["x1"]) <= 9:
+                    ov = max(0.0, min(seg["y2"], keep["y2"]) - max(seg["y1"], keep["y1"]))
+                    denom = max(1.0, min(seg["y2"]-seg["y1"], keep["y2"]-keep["y1"]))
+                    if ov / denom >= 0.70:
+                        duplicate = True
+                        break
+        if not duplicate:
+            final.append(seg)
+
+    # Build two diagnostics: centerline network and a slightly dilated wall mask.
+    centerline = np.zeros_like(gray)
+    for seg in final:
+        cv2.line(centerline,
+                 (int(round(seg["x1"])), int(round(seg["y1"]))),
+                 (int(round(seg["x2"])), int(round(seg["y2"]))),
+                 255, 2)
+
+    thickness = max(3, int(round(min(w, h) * 0.004)))
+    wall_mask = cv2.dilate(centerline, np.ones((thickness, thickness), np.uint8), iterations=1)
+    wall_mask = cv2.morphologyEx(
+        wall_mask,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)),
+        iterations=1,
+    )
+
+    # Attach dimensions required by the existing 3D generator later.
+    for seg in final:
+        seg["plan_width_px"] = int(w)
+        seg["plan_height_px"] = int(h)
+        seg["length_px"] = float(math.hypot(seg["x2"]-seg["x1"], seg["y2"]-seg["y1"]))
+
+    return final, centerline, wall_mask
+
+
+def build_architectural_wall_mask(gray, segments, wall_px=5):
+    """Compatibility wrapper for the V2.7.3 diagnostic wall mask."""
+    gray = np.asarray(gray)
+    if gray.ndim == 3:
+        gray = cv2.cvtColor(gray, cv2.COLOR_RGB2GRAY)
     h, w = gray.shape[:2]
     mask = np.zeros((h, w), dtype=np.uint8)
-
-    if not segments:
-        return mask
-
-    thickness = max(2, int(wall_px))
-    for seg in segments:
-        cv2.line(
-            mask,
-            (int(seg["x1"]), int(seg["y1"])),
-            (int(seg["x2"]), int(seg["y2"])),
-            255,
-            thickness,
-        )
-
-    # Bridge small gaps at wall intersections while avoiding aggressive filling.
-    close_size = max(3, min(11, int(min(h, w) * 0.008) | 1))
-    close_kernel = cv2.getStructuringElement(
-        cv2.MORPH_RECT, (close_size, close_size)
-    )
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel, iterations=1)
-
-    # Remove tiny isolated components that are unlikely to be structural walls.
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
-    cleaned = np.zeros_like(mask)
-    min_area = max(80, int(h * w * 0.00012))
-    for label in range(1, num_labels):
-        area = int(stats[label, cv2.CC_STAT_AREA])
-        width = int(stats[label, cv2.CC_STAT_WIDTH])
-        height = int(stats[label, cv2.CC_STAT_HEIGHT])
-        if area >= min_area and (width >= 20 or height >= 20):
-            cleaned[labels == label] = 255
-
-    return cleaned
-
+    for seg in segments or []:
+        cv2.line(mask,
+                 (int(seg["x1"]), int(seg["y1"])),
+                 (int(seg["x2"]), int(seg["y2"])),
+                 255, max(2, int(wall_px)))
+    return mask
 
 def create_wall_reconstruction_mesh(
     segments,
@@ -2498,15 +2666,16 @@ if page == "Blueprint → 3D":
                 cropped_gray
             )
 
-            wall_mask = build_architectural_wall_mask(
+            wall_mask_v273 = build_architectural_wall_mask(
                 cropped_gray,
                 wall_segments,
                 wall_px=5,
             )
 
-            for segment in wall_segments:
-                segment["plan_width_px"] = cropped_gray.shape[1]
-                segment["plan_height_px"] = cropped_gray.shape[0]
+            refined_wall_segments, wall_centerline, wall_mask = reconstruct_wall_network(
+                cropped_gray, wall_segments
+            )
+            wall_segments = refined_wall_segments
 
             st.success(
                 "✅ Primary blueprint region detected."
@@ -2575,7 +2744,7 @@ if page == "Blueprint → 3D":
                         wall_mask,
                         cv2.COLOR_GRAY2RGB,
                     ),
-                    caption="V2.7.3 Architectural Wall Mask",
+                    caption="V2.7.4 Architectural Wall Mask",
                     use_container_width=True,
                 )
 
@@ -2585,14 +2754,14 @@ if page == "Blueprint → 3D":
                         wall_overlay,
                         cv2.COLOR_GRAY2RGB,
                     ),
-                    caption=f"Filtered Wall Network ({len(wall_segments)})",
+                    caption=f"V2.7.4 Connected Wall Network ({len(wall_segments)})",
                     use_container_width=True,
                 )
 
             if wall_segments:
                 st.success(
-                    f"🧱 V2.7.3 retained {len(wall_segments)} filtered structural wall candidates and built an architectural wall mask. "
-                    "These are geometric candidates, not yet semantic room labels."
+                    f"🧱 V2.7.4 reconstructed {len(wall_segments)} connected structural wall segments from the V2.7.3 evidence. "
+                    "The network is still geometric evidence; room semantics come in V2.8."
                 )
             else:
                 st.warning(
@@ -2669,7 +2838,7 @@ if page == "Blueprint → 3D":
             st.subheader("4️⃣ V2.7 Wall-Network 3D Reconstruction")
 
             st.caption(
-                "V2.7.3 converts filtered wall evidence into a wall mask and then into 3D wall meshes. "
+                "V2.7.4 converts filtered wall evidence into a consolidated connected wall network and then into 3D wall meshes. "
                 "This upload is reconstructed as one floor only; it is not duplicated across the building."
             )
 
