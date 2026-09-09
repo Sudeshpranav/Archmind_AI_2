@@ -19,7 +19,7 @@ warnings.filterwarnings("ignore")
 # AI-POWERED CONSTRUCTION MATERIAL INTELLIGENCE
 # ============================================================
 
-APP_VERSION = "V2.5.1"
+APP_VERSION = "V2.6.0"
 
 HF_REPO_ID = "AloneMrY/archmind-pro-v2-2-models"
 
@@ -1347,56 +1347,104 @@ def show_geometry_metrics(
 
 
 # ============================================================
-# BLUEPRINT PREPROCESSING
+# ============================================================
+# V2.6 BLUEPRINT PREPROCESSING
 # ============================================================
 
 def preprocess_blueprint(image):
+    """
+    V2.6 Step 1:
+    Create several diagnostic representations instead of relying
+    on one aggressive adaptive-threshold image.
 
-    img = np.asarray(
-        image.convert("RGB")
-    )
+    The goal is to preserve architectural wall lines while
+    suppressing furniture/decorative noise as much as possible.
+    """
 
-    gray = cv2.cvtColor(
-        img,
-        cv2.COLOR_RGB2GRAY,
-    )
+    img = np.asarray(image.convert("RGB"))
 
-    gray = cv2.GaussianBlur(
-        gray,
+    # Limit processing size for predictable Streamlit performance.
+    max_dim = 1800
+    h, w = img.shape[:2]
+
+    if max(h, w) > max_dim:
+        scale = max_dim / max(h, w)
+        img = cv2.resize(
+            img,
+            (int(w * scale), int(h * scale)),
+            interpolation=cv2.INTER_AREA,
+        )
+
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+
+    # Edges are more useful for architectural line drawings than
+    # a raw threshold on this type of rendered blueprint.
+    edges = cv2.Canny(gray, 50, 150)
+
+    # Close small gaps in wall lines.
+    line_kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT,
         (5, 5),
-        0,
+    )
+    closed_edges = cv2.morphologyEx(
+        edges,
+        cv2.MORPH_CLOSE,
+        line_kernel,
+        iterations=2,
     )
 
-    binary = cv2.adaptiveThreshold(
+    # A second representation is retained for diagnostics.
+    adaptive = cv2.adaptiveThreshold(
         gray,
         255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY_INV,
-        21,
-        5,
+        31,
+        7,
     )
 
-    kernel = np.ones(
-        (3, 3),
-        np.uint8,
-    )
-
-    binary = cv2.morphologyEx(
-        binary,
+    small_kernel = np.ones((3, 3), np.uint8)
+    adaptive = cv2.morphologyEx(
+        adaptive,
         cv2.MORPH_CLOSE,
-        kernel,
-        iterations=2,
+        small_kernel,
+        iterations=1,
     )
 
-    return img, gray, binary
+    # Combine edge and adaptive evidence.
+    combined = cv2.bitwise_or(
+        closed_edges,
+        adaptive,
+    )
+
+    return img, gray, edges, closed_edges, adaptive, combined
 
 
-def detect_floorplan_bounds(
-    binary
-):
+def detect_floorplan_bounds(binary):
+    """
+    Detect the most plausible central architectural plan boundary.
+
+    We deliberately avoid simply selecting contours[0], because a
+    rendered blueprint often contains an outer page frame, compass,
+    furniture and decorative objects.
+    """
+
+    h, w = binary.shape[:2]
+    image_area = float(h * w)
+
+    # Ignore a small page margin so the outer image border is less
+    # likely to become the floor-plan contour.
+    margin_x = max(5, int(w * 0.03))
+    margin_y = max(5, int(h * 0.03))
+
+    roi = binary[
+        margin_y:h - margin_y,
+        margin_x:w - margin_x,
+    ]
 
     contours, _ = cv2.findContours(
-        binary,
+        roi,
         cv2.RETR_EXTERNAL,
         cv2.CHAIN_APPROX_SIMPLE,
     )
@@ -1404,43 +1452,187 @@ def detect_floorplan_bounds(
     if not contours:
         return None
 
-    contours = sorted(
-        contours,
-        key=cv2.contourArea,
+    candidates = []
+
+    for contour in contours:
+        area = cv2.contourArea(contour)
+
+        if area < image_area * 0.02:
+            continue
+
+        x, y, cw, ch = cv2.boundingRect(contour)
+
+        if cw < w * 0.12 or ch < h * 0.12:
+            continue
+
+        rect_area = float(cw * ch)
+        fill_ratio = safe_div(area, rect_area)
+
+        aspect = safe_div(cw, ch)
+
+        # Most architectural floor plans are not tiny extreme
+        # aspect-ratio objects.
+        if aspect < 0.12 or aspect > 8.0:
+            continue
+
+        # Prefer large, reasonably filled, central candidates.
+        center_x = x + cw / 2
+        center_y = y + ch / 2
+
+        roi_cx = roi.shape[1] / 2
+        roi_cy = roi.shape[0] / 2
+
+        center_distance = (
+            safe_div(
+                abs(center_x - roi_cx),
+                max(roi.shape[1], 1),
+            )
+            +
+            safe_div(
+                abs(center_y - roi_cy),
+                max(roi.shape[0], 1),
+            )
+        )
+
+        size_score = min(
+            1.0,
+            rect_area / (image_area * 0.75),
+        )
+
+        fill_score = min(
+            1.0,
+            max(0.0, fill_ratio),
+        )
+
+        central_score = max(
+            0.0,
+            1.0 - center_distance,
+        )
+
+        score = (
+            size_score * 0.55
+            +
+            fill_score * 0.20
+            +
+            central_score * 0.25
+        )
+
+        candidates.append(
+            (
+                score,
+                x + margin_x,
+                y + margin_y,
+                cw,
+                ch,
+                area,
+            )
+        )
+
+    if not candidates:
+        return None
+
+    candidates.sort(
+        key=lambda item: item[0],
         reverse=True,
     )
 
-    largest = contours[0]
-
-    x, y, w, h = cv2.boundingRect(
-        largest
-    )
-
-    image_area = (
-        binary.shape[0] *
-        binary.shape[1]
-    )
-
-    contour_area = cv2.contourArea(
-        largest
-    )
-
-    if contour_area < (
-        image_area * 0.02
-    ):
-
-        return None
+    score, x, y, cw, ch, area = candidates[0]
 
     return {
-        "x": x,
-        "y": y,
-        "width_px": w,
-        "height_px": h,
-        "area_px": contour_area,
+        "x": int(x),
+        "y": int(y),
+        "width_px": int(cw),
+        "height_px": int(ch),
+        "area_px": float(area),
+        "score": float(score),
     }
 
 
-# ============================================================
+def detect_architectural_lines(edges):
+    """
+    Detect long horizontal/vertical lines.
+
+    These are not yet room walls. They are V2.6 structural
+    candidates used to build the next reconstruction stage.
+    """
+
+    h, w = edges.shape[:2]
+
+    min_horizontal = max(30, int(w * 0.08))
+    min_vertical = max(30, int(h * 0.08))
+
+    horizontal_kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT,
+        (max(3, min_horizontal // 4), 1),
+    )
+
+    vertical_kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT,
+        (1, max(3, min_vertical // 4)),
+    )
+
+    horizontal = cv2.morphologyEx(
+        edges,
+        cv2.MORPH_OPEN,
+        horizontal_kernel,
+    )
+
+    vertical = cv2.morphologyEx(
+        edges,
+        cv2.MORPH_OPEN,
+        vertical_kernel,
+    )
+
+    combined = cv2.bitwise_or(
+        horizontal,
+        vertical,
+    )
+
+    # Count detected line pixels as a simple diagnostic signal.
+    line_pixels = int(
+        np.count_nonzero(combined)
+    )
+
+    return horizontal, vertical, combined, line_pixels
+
+
+def crop_blueprint_region(image_array, bounds, padding=8):
+    """
+    Crop the detected plan for downstream processing.
+    """
+
+    if bounds is None:
+        return image_array
+
+    h, w = image_array.shape[:2]
+
+    x1 = max(
+        0,
+        bounds["x"] - padding,
+    )
+    y1 = max(
+        0,
+        bounds["y"] - padding,
+    )
+    x2 = min(
+        w,
+        bounds["x"]
+        + bounds["width_px"]
+        + padding,
+    )
+    y2 = min(
+        h,
+        bounds["y"]
+        + bounds["height_px"]
+        + padding,
+    )
+
+    return image_array[
+        y1:y2,
+        x1:x2,
+    ]
+
+
 # PROCEDURAL 3D BUILDING
 # ============================================================
 
@@ -1856,28 +2048,29 @@ def predict_materials(
 
 
 # ============================================================
+# ============================================================
 # PAGE: BLUEPRINT → 3D
 # ============================================================
 
 if page == "Blueprint → 3D":
 
-    st.header(
-        "🖼️ Blueprint → 3D Reconstruction"
-    )
+    st.header("🖼️ Blueprint → 3D Reconstruction")
 
     st.write(
-        "Upload a 2D floor plan. ArchMind extracts "
-        "the primary footprint and generates a "
-        "procedural 3D building model."
+        "V2.6 Step 1 analyzes the blueprint using computer vision "
+        "to identify the primary plan region and long architectural "
+        "line candidates before 3D reconstruction."
+    )
+
+    st.info(
+        "🔬 V2.6 is currently a reconstruction foundation. "
+        "It does not claim to understand every room, dimension, "
+        "door or furniture object yet."
     )
 
     blueprint = st.file_uploader(
         "Upload Blueprint / Floor Plan",
-        type=[
-            "png",
-            "jpg",
-            "jpeg",
-        ],
+        type=["png", "jpg", "jpeg"],
         key="blueprint",
     )
 
@@ -1887,13 +2080,24 @@ if page == "Blueprint → 3D":
         max_value=500.0,
         value=30.0,
         step=1.0,
+        help=(
+            "Use a reliable overall building width if the drawing "
+            "does not provide a machine-readable overall dimension. "
+            "V2.6 will use this only for scale estimation."
+        ),
     )
 
     if blueprint:
 
-        image = Image.open(
-            blueprint
+        image = Image.open(blueprint).convert("RGB")
+
+        original, gray, edges, closed_edges, adaptive, combined = (
+            preprocess_blueprint(image)
         )
+
+        bounds = detect_floorplan_bounds(combined)
+
+        st.subheader("1️⃣ Blueprint Analysis")
 
         st.image(
             image,
@@ -1901,87 +2105,139 @@ if page == "Blueprint → 3D":
             use_container_width=True,
         )
 
-        original, gray, binary = (
-            preprocess_blueprint(
-                image
-            )
-        )
-
-        bounds = detect_floorplan_bounds(
-            binary
-        )
-
         if bounds is None:
 
             st.error(
-                "Could not detect a clear "
-                "floor-plan boundary."
+                "Could not detect a reliable central floor-plan "
+                "region. Try a clearer blueprint with visible wall lines."
             )
 
         else:
 
-            width_px = (
-                bounds[
-                    "width_px"
-                ]
+            cropped = crop_blueprint_region(
+                original,
+                bounds,
+                padding=10,
             )
 
-            height_px = (
-                bounds[
-                    "height_px"
-                ]
-            )
-
-            scale = (
-                known_width /
-                width_px
-            )
-
-            detected_depth = (
-                height_px *
-                scale
+            horizontal, vertical, line_mask, line_pixels = (
+                detect_architectural_lines(edges)
             )
 
             st.success(
-                "Blueprint boundary detected."
+                "✅ Primary blueprint region detected."
+            )
+
+            c1, c2, c3, c4 = st.columns(4)
+
+            with c1:
+                st.metric(
+                    "Plan Width",
+                    f"{bounds['width_px']:,} px",
+                )
+
+            with c2:
+                st.metric(
+                    "Plan Height",
+                    f"{bounds['height_px']:,} px",
+                )
+
+            with c3:
+                st.metric(
+                    "Boundary Score",
+                    f"{bounds['score']:.2f}",
+                )
+
+            with c4:
+                st.metric(
+                    "Line Pixels",
+                    f"{line_pixels:,}",
+                )
+
+            st.subheader("2️⃣ Computer Vision Diagnostics")
+
+            d1, d2, d3 = st.columns(3)
+
+            with d1:
+                st.image(
+                    cv2.cvtColor(
+                        edges,
+                        cv2.COLOR_GRAY2RGB,
+                    ),
+                    caption="Edge Map",
+                    use_container_width=True,
+                )
+
+            with d2:
+                st.image(
+                    cv2.cvtColor(
+                        line_mask,
+                        cv2.COLOR_GRAY2RGB,
+                    ),
+                    caption="Long Architectural Line Candidates",
+                    use_container_width=True,
+                )
+
+            with d3:
+                st.image(
+                    cropped,
+                    caption="Detected Plan Region",
+                    use_container_width=True,
+                )
+
+            st.subheader("3️⃣ Current Scale Estimate")
+
+            width_px = bounds["width_px"]
+            height_px = bounds["height_px"]
+
+            scale = safe_div(
+                known_width,
+                width_px,
+            )
+
+            detected_depth = (
+                height_px * scale
             )
 
             c1, c2, c3 = st.columns(3)
 
             with c1:
-
                 st.metric(
-                    "Detected Width",
+                    "Reference Width",
                     f"{known_width:.1f} ft",
                 )
 
             with c2:
-
                 st.metric(
                     "Estimated Depth",
                     f"{detected_depth:.1f} ft",
                 )
 
             with c3:
-
                 st.metric(
-                    "Floors",
-                    num_floors_input,
+                    "Estimated Footprint",
+                    f"{known_width * detected_depth:,.0f} sqft",
                 )
 
+            st.caption(
+                "⚠️ This scale is based on the user-provided reference "
+                "width. Automatic dimension/OCR scale extraction is a "
+                "later V2.6/V2.7 stage."
+            )
+
+            st.subheader("4️⃣ Generate Procedural 3D Baseline")
+
             if st.button(
-                "🏗️ Generate 3D Building",
+                "🏗️ Generate 3D Building Baseline",
                 type="primary",
             ):
 
-                generated_mesh = (
-                    create_building_mesh(
-                        known_width,
-                        detected_depth,
-                        num_floors_input,
-                        floor_height,
-                        wall_thickness,
-                    )
+                generated_mesh = create_building_mesh(
+                    known_width,
+                    detected_depth,
+                    num_floors_input,
+                    floor_height,
+                    wall_thickness,
                 )
 
                 st.session_state[
@@ -1989,46 +2245,56 @@ if page == "Blueprint → 3D":
                 ] = generated_mesh
 
                 st.success(
-                    "3D building geometry generated."
+                    "✅ Baseline 3D geometry generated."
                 )
 
-        if (
-            "generated_mesh"
-            in st.session_state
-        ):
+            if "generated_mesh" in st.session_state:
 
-            generated_mesh = (
-                st.session_state[
-                    "generated_mesh"
-                ]
-            )
+                generated_mesh = (
+                    st.session_state[
+                        "generated_mesh"
+                    ]
+                )
 
-            st.info(
-                "This is an MVP procedural "
-                "reconstruction, not a complete "
-                "architectural interpretation."
-            )
+                st.warning(
+                    "The current 3D result is still a baseline "
+                    "procedural model. The next reconstruction stage "
+                    "will convert detected wall lines into actual "
+                    "room/partition geometry."
+                )
 
-            st.metric(
-                "Generated Height",
-                f"{generated_mesh.extents[2]:.1f} ft",
-            )
+                c1, c2, c3 = st.columns(3)
 
-            stl_bytes = export_mesh_stl(
-                generated_mesh
-            )
+                with c1:
+                    st.metric(
+                        "Generated Width",
+                        f"{generated_mesh.extents[0]:.1f} ft",
+                    )
 
-            st.download_button(
-                "⬇️ Download Generated STL",
-                data=stl_bytes,
-                file_name=(
-                    "archmind_generated_building.stl"
-                ),
-                mime="model/stl",
-            )
+                with c2:
+                    st.metric(
+                        "Generated Depth",
+                        f"{generated_mesh.extents[1]:.1f} ft",
+                    )
+
+                with c3:
+                    st.metric(
+                        "Generated Height",
+                        f"{generated_mesh.extents[2]:.1f} ft",
+                    )
+
+                stl_bytes = export_mesh_stl(
+                    generated_mesh
+                )
+
+                st.download_button(
+                    "⬇️ Download Generated STL",
+                    data=stl_bytes,
+                    file_name="archmind_generated_building.stl",
+                    mime="model/stl",
+                )
 
 
-# ============================================================
 # PAGE: STL MATERIAL PREDICTION
 # ============================================================
 
@@ -2502,12 +2768,12 @@ elif page == "Feature Preview":
 
             confirmed_floors = (
                 st.session_state.get(
-                    "confirmed_floors",
-                    geometry[
-                        "estimated_floors"
-                    ],
+                    "confirmed_floors"
                 )
             )
+
+            if confirmed_floors is None:
+                confirmed_floors = num_floors_input
 
             feature_df = (
                 build_prediction_features(
@@ -2550,7 +2816,7 @@ elif page == "About":
 
     st.markdown(
         """
-## ArchMind Pro V2.5.1
+## ArchMind Pro V2.6.0
 
 ArchMind Pro is an AI-powered construction
 material intelligence prototype.
@@ -2568,7 +2834,7 @@ material intelligence prototype.
 → Custom ML Models
 → Material Prediction
 
-### V2.5.1 Improvements
+### V2.6.0 Improvements
 
 - Automatic floor estimation
 - Building plausibility classification
@@ -2578,6 +2844,7 @@ material intelligence prototype.
 - Geometry validation
 - STL processing
 - Blueprint → 3D MVP
+[L26 - Step 1] Multi-stage blueprint preprocessing and architectural line diagnostics
 - Existing material prediction models
 - Hugging Face model loading
 
@@ -2625,8 +2892,8 @@ Hugging Face Hub
 
 ### Roadmap
 
-**V2.5.1**
-Intelligent building geometry validation
+**V2.6.0**
+Intelligent blueprint preprocessing + building geometry validation
 
 **V3**
 Better structural feature extraction
