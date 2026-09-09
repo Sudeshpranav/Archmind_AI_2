@@ -19,7 +19,7 @@ warnings.filterwarnings("ignore")
 # AI-POWERED CONSTRUCTION MATERIAL INTELLIGENCE
 # ============================================================
 
-APP_VERSION = "V2.6.1"
+APP_VERSION = "V2.7.0"
 
 HF_REPO_ID = "AloneMrY/archmind-pro-v2-2-models"
 
@@ -1348,7 +1348,7 @@ def show_geometry_metrics(
 
 # ============================================================
 # ============================================================
-# V2.6 BLUEPRINT PREPROCESSING
+# V2.7 BLUEPRINT WALL RECONSTRUCTION
 # ============================================================
 
 def preprocess_blueprint(image):
@@ -1632,6 +1632,229 @@ def crop_blueprint_region(image_array, bounds, padding=8):
         x1:x2,
     ]
 
+
+
+def detect_wall_segments(plan_gray, min_length_ratio=0.045):
+    """V2.7: detect candidate horizontal/vertical wall centerlines.
+
+    This is deliberately a geometry-first detector. It does not claim
+    to semantically identify rooms, doors, furniture, or labels yet.
+    Long collinear architectural strokes are merged into wall segments.
+    """
+    gray = np.asarray(plan_gray)
+    h, w = gray.shape[:2]
+
+    if h < 20 or w < 20:
+        return [], np.zeros_like(gray)
+
+    edges = cv2.Canny(gray, 50, 150)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    min_len = max(25, int(min(h, w) * min_length_ratio))
+    raw = cv2.HoughLinesP(
+        edges,
+        1,
+        np.pi / 180,
+        threshold=max(25, int(min(h, w) * 0.035)),
+        minLineLength=min_len,
+        maxLineGap=max(8, int(min(h, w) * 0.015)),
+    )
+
+    if raw is None:
+        return [], edges
+
+    horizontal = []
+    vertical = []
+
+    for line in raw[:, 0, :]:
+        x1, y1, x2, y2 = [int(v) for v in line]
+        dx = x2 - x1
+        dy = y2 - y1
+        length = math.hypot(dx, dy)
+        if length < min_len:
+            continue
+
+        angle = abs(math.degrees(math.atan2(dy, dx)))
+        if angle > 90:
+            angle = 180 - angle
+
+        # Keep near-axis-aligned architectural lines.
+        if angle <= 7:
+            y = (y1 + y2) / 2.0
+            horizontal.append((y, min(x1, x2), max(x1, x2)))
+        elif abs(angle - 90) <= 7:
+            x = (x1 + x2) / 2.0
+            vertical.append((x, min(y1, y2), max(y1, y2)))
+
+    def merge_segments(items, axis_limit, coord_tol=10, gap_tol=18):
+        if not items:
+            return []
+
+        # Cluster parallel strokes by their perpendicular coordinate.
+        items = sorted(items, key=lambda v: (v[0], v[1]))
+        clusters = []
+        current = [items[0]]
+
+        for item in items[1:]:
+            if abs(item[0] - np.mean([v[0] for v in current])) <= coord_tol:
+                current.append(item)
+            else:
+                clusters.append(current)
+                current = [item]
+        clusters.append(current)
+
+        output = []
+        for cluster in clusters:
+            coord = float(np.median([v[0] for v in cluster]))
+            intervals = sorted((v[1], v[2]) for v in cluster)
+            merged = []
+            start, end = intervals[0]
+
+            for a, b in intervals[1:]:
+                if a <= end + gap_tol:
+                    end = max(end, b)
+                else:
+                    if end - start >= axis_limit * 0.035:
+                        merged.append((start, end))
+                    start, end = a, b
+
+            if end - start >= axis_limit * 0.035:
+                merged.append((start, end))
+
+            for start, end in merged:
+                output.append((coord, start, end))
+
+        return output
+
+    h_segments = merge_segments(horizontal, w)
+    v_segments = merge_segments(vertical, h)
+
+    # Convert to a common segment representation and remove very short noise.
+    segments = []
+    for y, x1, x2 in h_segments:
+        length = float(x2 - x1)
+        if length >= min_len:
+            segments.append({
+                "orientation": "horizontal",
+                "x1": float(x1), "y1": float(y),
+                "x2": float(x2), "y2": float(y),
+                "length_px": length,
+            })
+
+    for x, y1, y2 in v_segments:
+        length = float(y2 - y1)
+        if length >= min_len:
+            segments.append({
+                "orientation": "vertical",
+                "x1": float(x), "y1": float(y1),
+                "x2": float(x), "y2": float(y2),
+                "length_px": length,
+            })
+
+    # Prefer the longest candidates if a blueprint is unusually dense.
+    segments.sort(key=lambda s: s["length_px"], reverse=True)
+    segments = segments[:100]
+
+    overlay = np.zeros_like(gray)
+    for seg in segments:
+        cv2.line(
+            overlay,
+            (int(seg["x1"]), int(seg["y1"])),
+            (int(seg["x2"]), int(seg["y2"])),
+            255,
+            2,
+        )
+
+    return segments, overlay
+
+
+def create_wall_reconstruction_mesh(
+    segments,
+    plan_width_ft,
+    plan_depth_ft,
+    num_floors,
+    floor_height,
+    wall_thickness_in,
+):
+    """Create a procedural 3D wall network from V2.7 line candidates."""
+    if not segments:
+        return None
+
+    wall_t = max(0.15, wall_thickness_in / 12.0)
+    total_height = max(1.0, num_floors * floor_height)
+
+    # Pixel-to-foot mapping for the detected/cropped plan region.
+    # x maps left→right, y maps top→bottom.
+    parts = []
+    used = 0
+
+    for seg in segments:
+        x1 = np.clip(seg["x1"], 0, max(1, seg.get("plan_width_px", 1)))
+        x2 = np.clip(seg["x2"], 0, max(1, seg.get("plan_width_px", 1)))
+        y1 = np.clip(seg["y1"], 0, max(1, seg.get("plan_height_px", 1)))
+        y2 = np.clip(seg["y2"], 0, max(1, seg.get("plan_height_px", 1)))
+
+        pw = float(seg.get("plan_width_px", 1))
+        ph = float(seg.get("plan_height_px", 1))
+        if pw <= 1 or ph <= 1:
+            continue
+
+        fx1 = (x1 / pw - 0.5) * plan_width_ft
+        fx2 = (x2 / pw - 0.5) * plan_width_ft
+        fy1 = (0.5 - y1 / ph) * plan_depth_ft
+        fy2 = (0.5 - y2 / ph) * plan_depth_ft
+
+        if seg["orientation"] == "horizontal":
+            length = abs(fx2 - fx1)
+            if length < 1.5:
+                continue
+            center = [(fx1 + fx2) / 2.0, (fy1 + fy2) / 2.0, 0]
+            wall = trimesh.creation.box(
+                extents=[length, wall_t, floor_height]
+            )
+        else:
+            length = abs(fy2 - fy1)
+            if length < 1.5:
+                continue
+            center = [(fx1 + fx2) / 2.0, (fy1 + fy2) / 2.0, 0]
+            wall = trimesh.creation.box(
+                extents=[wall_t, length, floor_height]
+            )
+
+        # Repeat the detected floor-plan walls on each configured floor.
+        for floor_idx in range(int(num_floors)):
+            part = wall.copy()
+            part.apply_translation(
+                [center[0], center[1], floor_idx * floor_height + floor_height / 2.0]
+            )
+            parts.append(part)
+            used += 1
+
+        if used >= 250:
+            break
+
+    if not parts:
+        return None
+
+    # Add floor slabs so the reconstructed wall network has a usable building shell.
+    slab_t = 0.5
+    for floor_idx in range(int(num_floors)):
+        slab = trimesh.creation.box(
+            extents=[plan_width_ft, plan_depth_ft, slab_t]
+        )
+        slab.apply_translation(
+            [0, 0, floor_idx * floor_height]
+        )
+        parts.append(slab)
+
+    roof = trimesh.creation.box(
+        extents=[plan_width_ft, plan_depth_ft, slab_t]
+    )
+    roof.apply_translation([0, 0, total_height])
+    parts.append(roof)
+
+    return trimesh.util.concatenate(parts)
 
 # PROCEDURAL 3D BUILDING
 # ============================================================
@@ -2063,9 +2286,9 @@ if page == "Blueprint → 3D":
     )
 
     st.info(
-        "🔬 V2.6 is currently a reconstruction foundation. "
-        "It does not claim to understand every room, dimension, "
-        "door or furniture object yet."
+        "🧱 V2.7 is a geometry-first reconstruction stage. "
+        "It does not yet claim semantic room/door/furniture recognition; "
+        "the detected wall network is an intermediate reconstruction."
     )
 
     blueprint = st.file_uploader(
@@ -2146,6 +2369,19 @@ if page == "Blueprint → 3D":
                 detect_architectural_lines(edges)
             )
 
+            cropped_pil = Image.fromarray(cropped)
+            cropped_gray = cv2.cvtColor(
+                np.asarray(cropped_pil),
+                cv2.COLOR_RGB2GRAY,
+            )
+            wall_segments, wall_overlay = detect_wall_segments(
+                cropped_gray
+            )
+
+            for segment in wall_segments:
+                segment["plan_width_px"] = cropped_gray.shape[1]
+                segment["plan_height_px"] = cropped_gray.shape[0]
+
             st.success(
                 "✅ Primary blueprint region detected."
             )
@@ -2178,7 +2414,7 @@ if page == "Blueprint → 3D":
 
             st.subheader("2️⃣ Computer Vision Diagnostics")
 
-            d1, d2, d3 = st.columns(3)
+            d1, d2, d3, d4 = st.columns(4)
 
             with d1:
                 st.image(
@@ -2205,6 +2441,27 @@ if page == "Blueprint → 3D":
                     cropped,
                     caption="Detected Plan Region",
                     use_container_width=True,
+                )
+
+            with d4:
+                st.image(
+                    cv2.cvtColor(
+                        wall_overlay,
+                        cv2.COLOR_GRAY2RGB,
+                    ),
+                    caption=f"V2.7 Wall Candidates ({len(wall_segments)})",
+                    use_container_width=True,
+                )
+
+            if wall_segments:
+                st.success(
+                    f"🧱 V2.7 detected {len(wall_segments)} candidate wall segments. "
+                    "These are geometric candidates, not yet semantic room labels."
+                )
+            else:
+                st.warning(
+                    "⚠️ No stable wall segments were detected. Try a clearer plan "
+                    "or a blueprint with stronger architectural wall lines."
                 )
 
             st.subheader("3️⃣ Calibrated Scale Estimate")
@@ -2273,21 +2530,28 @@ if page == "Blueprint → 3D":
                 "For now, use an actual overall exterior dimension when available."
             )
 
-            st.subheader("4️⃣ Generate Procedural 3D Baseline")
+            st.subheader("4️⃣ V2.7 Wall-Network 3D Reconstruction")
+
+            st.caption(
+                "V2.7 converts detected horizontal/vertical architectural line candidates "
+                "into wall meshes. This is the first step beyond the simple rectangular baseline."
+            )
 
             if st.button(
-                "🏗️ Generate 3D Building Baseline",
+                "🏗️ Reconstruct 3D Wall Network",
                 type="primary",
             ):
 
                 if calibration_mode == "No Overall Dimension Available":
                     st.error(
-                        "❌ Please provide an overall building width or depth before "
-                        "generating a real-world 3D baseline."
+                        "❌ Provide an overall building width or depth before generating "
+                        "a real-world 3D reconstruction."
                     )
                     st.stop()
 
-                generated_mesh = create_building_mesh(
+                reconstructed_segments = [dict(seg) for seg in wall_segments]
+                generated_mesh = create_wall_reconstruction_mesh(
+                    reconstructed_segments,
                     calibrated_width,
                     calibrated_depth,
                     num_floors_input,
@@ -2295,13 +2559,17 @@ if page == "Blueprint → 3D":
                     wall_thickness,
                 )
 
-                st.session_state[
-                    "generated_mesh"
-                ] = generated_mesh
-
-                st.success(
-                    "✅ Baseline 3D geometry generated."
-                )
+                if generated_mesh is None:
+                    st.error(
+                        "❌ Wall reconstruction failed because no usable wall segments "
+                        "were detected. The rectangular baseline is still available below."
+                    )
+                else:
+                    st.session_state["generated_mesh"] = generated_mesh
+                    st.success(
+                        f"✅ V2.7 wall-network geometry generated from {len(reconstructed_segments)} "
+                        "candidate segments."
+                    )
 
             if "generated_mesh" in st.session_state:
 
@@ -2312,10 +2580,9 @@ if page == "Blueprint → 3D":
                 )
 
                 st.warning(
-                    "The current 3D result is still a baseline "
-                    "procedural model. The next reconstruction stage "
-                    "will convert detected wall lines into actual "
-                    "room/partition geometry."
+                    "V2.7 is an intermediate wall-network reconstruction. "
+                    "It uses detected architectural line candidates; room semantics, "
+                    "doors/windows, and exact wall topology are the next stage."
                 )
 
                 c1, c2, c3 = st.columns(3)
