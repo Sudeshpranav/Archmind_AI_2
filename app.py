@@ -19,7 +19,7 @@ warnings.filterwarnings("ignore")
 # AI-POWERED CONSTRUCTION MATERIAL INTELLIGENCE
 # ============================================================
 
-APP_VERSION = "V2.7.4"
+APP_VERSION = "V2.8.0"
 
 HF_REPO_ID = "AloneMrY/archmind-pro-v2-2-models"
 
@@ -2054,6 +2054,311 @@ def build_architectural_wall_mask(gray, segments, wall_px=5):
                  255, max(2, int(wall_px)))
     return mask
 
+def detect_rooms_from_wall_network(
+    gray,
+    wall_centerline,
+    plan_width_ft=None,
+    plan_depth_ft=None,
+):
+    """V2.8.0: detect enclosed floor-plan spaces from the wall network.
+
+    This stage deliberately detects *spaces*, not semantic room names.
+    It uses the wall centerline as a barrier, closes small architectural
+    openings such as door gaps, flood-fills the exterior, then extracts
+    sufficiently large enclosed regions as room candidates.
+
+    The result is an evidence-based room/space candidate map. Labels such
+    as Bedroom, Kitchen, Toilet, etc. are reserved for a later OCR/semantic
+    stage.
+    """
+    gray = np.asarray(gray)
+    if gray.ndim == 3:
+        gray = cv2.cvtColor(gray, cv2.COLOR_RGB2GRAY)
+
+    h, w = gray.shape[:2]
+    if h < 40 or w < 40:
+        return [], np.zeros((h, w), np.uint8), np.zeros((h, w, 3), np.uint8), {
+            "room_count": 0,
+            "candidate_count": 0,
+            "min_area_px": 0,
+            "wall_thickness_px": 0,
+        }
+
+    if wall_centerline is None or np.count_nonzero(wall_centerline) == 0:
+        return [], np.zeros((h, w), np.uint8), np.zeros((h, w, 3), np.uint8), {
+            "room_count": 0,
+            "candidate_count": 0,
+            "min_area_px": 0,
+            "wall_thickness_px": 0,
+        }
+
+    # --------------------------------------------------------
+    # Build a barrier from the consolidated wall centerlines.
+    # Door gaps and tiny line breaks should not merge two rooms into
+    # one giant connected free-space component, so use moderate
+    # morphology rather than a very large dilation.
+    # --------------------------------------------------------
+    center = (wall_centerline > 0).astype(np.uint8) * 255
+
+    wall_thickness_px = 5
+
+    kernel_size = wall_thickness_px if wall_thickness_px % 2 == 1 else wall_thickness_px + 1
+    barrier = cv2.dilate(
+        center,
+        np.ones((kernel_size, kernel_size), np.uint8),
+        iterations=1,
+    )
+
+    # Bridge small gaps caused by doors, anti-aliasing and imperfect Hough
+    # reconstruction. Keep this intentionally modest to avoid swallowing
+    # narrow rooms/corridors.
+    gap_kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT,
+        (7, 7),
+    )
+    barrier = cv2.morphologyEx(
+        barrier,
+        cv2.MORPH_CLOSE,
+        gap_kernel,
+        iterations=1,
+    )
+
+    # Ensure the exterior boundary is closed. The existing network normally
+    # contains the outer walls, but this small frame prevents a broken corner
+    # from allowing flood-fill to leak into the building.
+    frame_t = max(3, wall_thickness_px // 2)
+    cv2.rectangle(
+        barrier,
+        (frame_t, frame_t),
+        (w - 1 - frame_t, h - 1 - frame_t),
+        255,
+        frame_t,
+    )
+
+    # --------------------------------------------------------
+    # Free-space connected components after removing the exterior.
+    # --------------------------------------------------------
+    free = (barrier == 0).astype(np.uint8)
+
+    outside = free.copy()
+    flood_mask = np.zeros(
+        (h + 2, w + 2),
+        np.uint8,
+    )
+    cv2.floodFill(
+        outside,
+        flood_mask,
+        (0, 0),
+        0,
+        flags=8,
+    )
+
+    enclosed = (outside > 0).astype(np.uint8)
+
+    # --------------------------------------------------------
+    # Candidate threshold is relative to the plan size. For the supplied
+    # architectural drawing this keeps normal rooms while rejecting tiny
+    # furniture/text islands. It is deliberately not a fixed room count.
+    # --------------------------------------------------------
+    plan_area = float(h * w)
+    min_area_px = max(
+        500,
+        int(plan_area * 0.00125),
+    )
+    max_area_px = int(plan_area * 0.45)
+
+    n_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        enclosed,
+        connectivity=8,
+    )
+
+    candidates = []
+
+    for label_id in range(1, n_labels):
+        area_px = int(stats[label_id, cv2.CC_STAT_AREA])
+        if area_px < min_area_px or area_px > max_area_px:
+            continue
+
+        x = int(stats[label_id, cv2.CC_STAT_LEFT])
+        y = int(stats[label_id, cv2.CC_STAT_TOP])
+        bw = int(stats[label_id, cv2.CC_STAT_WIDTH])
+        bh = int(stats[label_id, cv2.CC_STAT_HEIGHT])
+
+        if bw < max(22, int(w * 0.035)) or bh < max(22, int(h * 0.015)):
+            continue
+
+        bbox_area = max(1, bw * bh)
+        rectangularity = safe_div(area_px, bbox_area)
+        aspect = safe_div(max(bw, bh), max(1, min(bw, bh)))
+
+        # Extremely thin regions are more likely to be annotation remnants
+        # or circulation slivers than rooms.
+        if aspect > 12.0 and area_px < min_area_px * 2:
+            continue
+
+        cx, cy = centroids[label_id]
+
+        if plan_width_ft and plan_depth_ft:
+            px_to_ft_x = safe_div(plan_width_ft, w)
+            px_to_ft_y = safe_div(plan_depth_ft, h)
+            area_sqft = area_px * px_to_ft_x * px_to_ft_y
+            width_ft = bw * px_to_ft_x
+            depth_ft = bh * px_to_ft_y
+        else:
+            area_sqft = None
+            width_ft = None
+            depth_ft = None
+
+        # A simple evidence score. This is NOT a semantic classifier.
+        score = 50.0
+        if rectangularity >= 0.55:
+            score += 20
+        elif rectangularity >= 0.35:
+            score += 10
+        if area_px >= min_area_px * 2:
+            score += 15
+        if aspect <= 8:
+            score += 10
+        if bw >= w * 0.05 and bh >= h * 0.03:
+            score += 5
+        score = max(0.0, min(100.0, score))
+
+        candidates.append({
+            "id": len(candidates) + 1,
+            "label": int(label_id),
+            "area_px": area_px,
+            "x": x,
+            "y": y,
+            "width_px": bw,
+            "height_px": bh,
+            "centroid_x": float(cx),
+            "centroid_y": float(cy),
+            "rectangularity": rectangularity,
+            "aspect_ratio": aspect,
+            "area_sqft": area_sqft,
+            "width_ft": width_ft,
+            "depth_ft": depth_ft,
+            "confidence": score,
+        })
+
+    # Sort spatially from top to bottom, then left to right, and renumber.
+    candidates.sort(key=lambda r: (r["centroid_y"], r["centroid_x"]))
+    for idx, room in enumerate(candidates, 1):
+        room["id"] = idx
+
+    # --------------------------------------------------------
+    # Diagnostic images.
+    # --------------------------------------------------------
+    room_mask = np.zeros((h, w), np.uint8)
+    overlay = np.zeros((h, w, 3), np.uint8)
+
+    for room in candidates:
+        component = (labels == room["label"]).astype(np.uint8) * 255
+        room_mask[component > 0] = 255
+        contours, _ = cv2.findContours(
+            component,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+        cv2.drawContours(
+            overlay,
+            contours,
+            -1,
+            (255, 255, 255),
+            2,
+        )
+        cv2.circle(
+            overlay,
+            (int(round(room["centroid_x"])), int(round(room["centroid_y"]))),
+            5,
+            (255, 255, 255),
+            -1,
+        )
+        cv2.putText(
+            overlay,
+            str(room["id"]),
+            (
+                int(round(room["centroid_x"])) + 7,
+                int(round(room["centroid_y"])) - 7,
+            ),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+    # Add the barrier itself to the diagnostic so room boundaries remain clear.
+    overlay[barrier > 0] = (255, 255, 255)
+
+    # Re-draw labels after the barrier so they remain visible.
+    for room in candidates:
+        cv2.circle(
+            overlay,
+            (int(round(room["centroid_x"])), int(round(room["centroid_y"]))),
+            5,
+            (255, 255, 255),
+            -1,
+        )
+        cv2.putText(
+            overlay,
+            str(room["id"]),
+            (
+                int(round(room["centroid_x"])) + 7,
+                int(round(room["centroid_y"])) - 7,
+            ),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+    diagnostics = {
+        "room_count": len(candidates),
+        "candidate_count": len(candidates),
+        "min_area_px": min_area_px,
+        "wall_thickness_px": wall_thickness_px,
+        "enclosed_pixel_area": int(np.count_nonzero(enclosed)),
+    }
+
+    return candidates, room_mask, overlay, diagnostics
+
+
+def render_room_table(rooms):
+    """Render V2.8 room/space candidates as a compact table."""
+    if not rooms:
+        return
+
+    rows = []
+    for room in rooms:
+        rows.append({
+            "Space": f"Space {room['id']}",
+            "Area (sqft)": (
+                round(room["area_sqft"], 1)
+                if room.get("area_sqft") is not None
+                else None
+            ),
+            "Width (ft)": (
+                round(room["width_ft"], 1)
+                if room.get("width_ft") is not None
+                else None
+            ),
+            "Depth (ft)": (
+                round(room["depth_ft"], 1)
+                if room.get("depth_ft") is not None
+                else None
+            ),
+            "Geometry Confidence": f"{room['confidence']:.0f}%",
+        })
+
+    st.dataframe(
+        pd.DataFrame(rows),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
 def create_wall_reconstruction_mesh(
     segments,
     plan_width_ft,
@@ -2761,7 +3066,7 @@ if page == "Blueprint → 3D":
             if wall_segments:
                 st.success(
                     f"🧱 V2.7.4 reconstructed {len(wall_segments)} connected structural wall segments from the V2.7.3 evidence. "
-                    "The network is still geometric evidence; room semantics come in V2.8."
+                    "The network is still geometric evidence; room/space detection is now introduced in V2.8; semantic labels come later."
                 )
             else:
                 st.warning(
@@ -2769,7 +3074,75 @@ if page == "Blueprint → 3D":
                     "or a blueprint with stronger architectural wall lines."
                 )
 
-            st.subheader("3️⃣ Calibrated Scale Estimate")
+            st.subheader("3️⃣ V2.8 Room / Space Detection")
+
+            st.caption(
+                "V2.8 detects enclosed geometric spaces from the wall network. "
+                "It does not yet assign semantic names such as Bedroom, Kitchen, or Toilet."
+            )
+
+            rooms, room_mask, room_overlay, room_diag = detect_rooms_from_wall_network(
+                cropped_gray,
+                wall_centerline,
+            )
+
+            r1, r2, r3 = st.columns(3)
+
+            with r1:
+                st.metric(
+                    "Detected Spaces",
+                    room_diag["room_count"],
+                )
+
+            with r2:
+                st.metric(
+                    "Wall Thickness Evidence",
+                    f"{room_diag['wall_thickness_px']} px",
+                )
+
+            with r3:
+                st.metric(
+                    "Minimum Space Area",
+                    f"{room_diag['min_area_px']:,} px²",
+                )
+
+            rd1, rd2, rd3 = st.columns(3)
+
+            with rd1:
+                st.image(
+                    cv2.cvtColor(room_mask, cv2.COLOR_GRAY2RGB),
+                    caption="V2.8 Enclosed Space Mask",
+                    use_container_width=True,
+                )
+
+            with rd2:
+                st.image(
+                    room_overlay,
+                    caption=f"V2.8 Space Candidates ({room_diag['room_count']})",
+                    use_container_width=True,
+                )
+
+            with rd3:
+                st.image(
+                    cv2.cvtColor(wall_centerline, cv2.COLOR_GRAY2RGB),
+                    caption="Input Wall Centerline Network",
+                    use_container_width=True,
+                )
+
+            if rooms:
+                st.success(
+                    f"🧱 V2.8 identified {len(rooms)} enclosed geometric spaces from the wall network. "
+                    "These are room/space candidates, not yet semantic room labels."
+                )
+
+                st.session_state["detected_rooms"] = rooms
+                render_room_table(rooms)
+            else:
+                st.warning(
+                    "⚠️ No reliable enclosed spaces were detected. The wall network needs further refinement before semantic room analysis."
+                )
+
+            st.subheader("4️⃣ Calibrated Scale Estimate")
 
             width_px = float(bounds["width_px"])
             height_px = float(bounds["height_px"])
@@ -2835,7 +3208,22 @@ if page == "Blueprint → 3D":
                 "For now, use an actual overall exterior dimension when available."
             )
 
-            st.subheader("4️⃣ V2.7 Wall-Network 3D Reconstruction")
+            if rooms and calibration_mode != "No Overall Dimension Available":
+                px_to_ft_x = safe_div(calibrated_width, width_px)
+                px_to_ft_y = safe_div(calibrated_depth, height_px)
+                for room in rooms:
+                    room["area_sqft"] = room["area_px"] * px_to_ft_x * px_to_ft_y
+                    room["width_ft"] = room["width_px"] * px_to_ft_x
+                    room["depth_ft"] = room["height_px"] * px_to_ft_y
+
+                st.subheader("📐 V2.8 Calibrated Space Estimates")
+                st.caption(
+                    "Areas are pixel-derived from the calibrated overall plan dimensions. "
+                    "They are geometric estimates until automatic dimension/OCR extraction is added."
+                )
+                render_room_table(rooms)
+
+            st.subheader("5️⃣ V2.7 Wall-Network 3D Reconstruction")
 
             st.caption(
                 "V2.7.4 converts filtered wall evidence into a consolidated connected wall network and then into 3D wall meshes. "
@@ -2872,7 +3260,7 @@ if page == "Blueprint → 3D":
                 else:
                     st.session_state["generated_mesh"] = generated_mesh
                     st.success(
-                        f"✅ V2.7.3 single-floor wall-network geometry generated from {len(reconstructed_segments)} "
+                        f"✅ V2.7.4 single-floor wall-network geometry generated from {len(reconstructed_segments)} "
                         f"candidate segments for Floor {int(floor_number_input)}."
                     )
 
@@ -3470,7 +3858,7 @@ material intelligence prototype.
 - Floor configuration confirmation
 - Geometry validation
 - STL processing
-- Blueprint → 3D MVP
+- V2.8 geometric room/space detection
 [L26 - Step 1] Multi-stage blueprint preprocessing and architectural line diagnostics
 - Existing material prediction models
 - Hugging Face model loading
